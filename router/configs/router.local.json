@@ -1,0 +1,59 @@
+{
+  "server": {
+    "listen_addr": "127.0.0.1:8080",
+    "admin_addr": "127.0.0.1:9090"
+  },
+  "router": {
+    "run_id": "showcase-local",
+    "strategy": "round_robin",
+    "block_size_tokens": 16,
+    "cache_ttl_ms": 30000,
+    "decision_log_path": "",
+    "trace_log_path": "",
+    "entry_topology": {
+      "cloud": "local",
+      "region": "local",
+      "zone": "local-a",
+      "cluster_id": "showcase-local",
+      "node_id": "router-local"
+    }
+  },
+  "workers": [
+    {
+      "id": "worker-a",
+      "url": "http://127.0.0.1:8001",
+      "health": "ready",
+      "readiness_state": "ready",
+      "draining": false,
+      "queue_depth": 0,
+      "active_decode_blocks": 0,
+      "inflight_requests": 0,
+      "memory_pressure": 0.0,
+      "topology": {
+        "cloud": "local",
+        "region": "local",
+        "zone": "local-a",
+        "cluster_id": "showcase-local",
+        "node_id": "worker-a"
+      }
+    },
+    {
+      "id": "worker-b",
+      "url": "http://127.0.0.1:8002",
+      "health": "ready",
+      "readiness_state": "ready",
+      "draining": false,
+      "queue_depth": 0,
+      "active_decode_blocks": 0,
+      "inflight_requests": 0,
+      "memory_pressure": 0.0,
+      "topology": {
+        "cloud": "local",
+        "region": "local",
+        "zone": "local-b",
+        "cluster_id": "showcase-local",
+        "node_id": "worker-b"
+      }
+    }
+  ]
+}

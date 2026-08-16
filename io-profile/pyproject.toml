@@ -1,0 +1,5 @@
+[project]
+name = "ai-inference-storage-showcase-io-profile"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Local IO path benchmark and tier profile generator"

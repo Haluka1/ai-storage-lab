@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-inference-storage-showcase-kvstore"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "CPU-testable multi-tier KV storage protocol prototype"
+dependencies = [
+  "jsonschema>=4.23,<5",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.34,<2"]
+dev = []
+
+[tool.setuptools.packages.find]
+include = ["kvstore*"]

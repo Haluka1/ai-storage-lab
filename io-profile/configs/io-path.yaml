@@ -1,0 +1,6 @@
+{
+  "binary": "io-profile/build/io_path_bench",
+  "file_path": "/tmp/ai-inference-storage-showcase-io/profile.bin",
+  "file_size_mb": 8,
+  "raw_dir": "/tmp/ai-inference-storage-showcase-io/cases"
+}

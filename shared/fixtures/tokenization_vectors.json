@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "algorithm": "approx-tokenizer-sha256-units-v1",
+  "config_hash": "bae1e25ad3aa298a",
+  "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+  "scope": "router_runtime_approximation",
+  "block_hash_algorithm": "sha256-length-prefixed-parent-chain-v1",
+  "vectors": [
+    {
+      "name": "basic_ascii",
+      "prompt": "Hello, KV cache!",
+      "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+      "expected_units": ["Hello", ",", "KV", "cache", "!"],
+      "expected_tokens": [42256, 649260, 452846, 696352, 893061],
+      "block_size_tokens": 4,
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "144f2208b0fa169482d399e4f465ee6fed1d2f921b5cae77de307c633a3444c5",
+        "5f59d8724a81b9aac2225353e69ff139628af8b7036738028d7fa9a23c20ad2b"
+      ]
+    },
+    {
+      "name": "newline_role_prompt",
+      "prompt": "shared system prompt v1\nUser: hello",
+      "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+      "expected_units": ["shared", "system", "prompt", "v1", "User", ":", "hello"],
+      "expected_tokens": [461697, 128600, 181778, 785640, 274086, 294385, 363090],
+      "block_size_tokens": 4,
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "01fdb9a88416fb5106686e317b3904d3f6310b85a36c5eb8d4ae26d2dd6f94b3",
+        "842f397054921b90c0c38a277d9b916560b48365c52ba0e27001e713aef613f7"
+      ]
+    },
+    {
+      "name": "multimodal_placeholders",
+      "prompt": "image_digest:abc123 audio_digest:def456",
+      "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+      "expected_units": ["image_digest", ":", "abc123", "audio_digest", ":", "def456"],
+      "expected_tokens": [184301, 294385, 867208, 780997, 294385, 77508],
+      "block_size_tokens": 4,
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "approx-tokenizer-v1:config-sha256=bae1e25ad3aa298a",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "385e209092872e502321d2b23892d6a8a70d01a11b7c80d95e5a47ae5a5bea03",
+        "68c8fc357ffbc4582b61f32ffb0eae57e72df342073250a4f0142abf45f0cfb4"
+      ]
+    },
+    {
+      "name": "different_tokenizer_revision",
+      "prompt": "Hello, KV cache!",
+      "tokenizer_revision": "approx-tokenizer-v1:config-sha256=0000000000000000",
+      "expected_units": ["Hello", ",", "KV", "cache", "!"],
+      "expected_tokens": [247086, 879327, 120796, 282965, 157048],
+      "block_size_tokens": 4,
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "approx-tokenizer-v1:config-sha256=0000000000000000",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "bcd664242e71e4dd4ab658a2a94589c727bbc333a801ce306408d4a35d0a3ae0",
+        "ee92e3a875ce3a2f58ffb3b6f427c46d9d15881356d7538383c9a3e4b0604904"
+      ]
+    }
+  ]
+}

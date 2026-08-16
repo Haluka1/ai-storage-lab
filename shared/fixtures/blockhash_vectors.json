@@ -1,0 +1,175 @@
+{
+  "algorithm": "sha256-length-prefixed-parent-chain-v1",
+  "empty_parent": "0000000000000000000000000000000000000000000000000000000000000000",
+  "vectors": [
+    {
+      "name": "same_prompt_base",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "27fe4d020eb7e9717f8b255a5509d2af6f50940b39fab9a3cd55647204070c77",
+        "760338ee25cbdb8a224de25a1785208c6f539466f61fed6b33a580d6956dc7c4"
+      ]
+    },
+    {
+      "name": "different_tenant",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-b",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "331e5e90f877177bb7957525a96fbfa09e0a16842ac110e796f89da92e5cde0b",
+        "41e7ffc5ba3cac651f2bfdfff47585674b2931e89fc3f2c3d41c10d56b1ea612"
+      ]
+    },
+    {
+      "name": "different_model_revision",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-002",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "ea65d61c3631cf5f759b93e3ba8d8560017cc105c0fa8a89c5e46901311d6432",
+        "08aca7d971ade2b784aea294299c82c63a29610a9ea7adef04892cbe54c7421e"
+      ]
+    },
+    {
+      "name": "different_tokenizer",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-002",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "2ab0ffb9bb249670aad4ae95138aeddd37e679b911bd4a42753d4f94e4b7a938",
+        "a91c1cca91fc1cba4f1722922e1b0b00cac3b35c98e851da9b99e1d9136d2d97"
+      ]
+    },
+    {
+      "name": "different_lora",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "adapter-a",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "3cd8cced29555f8b637195830159ba3fd287ca803eb0ccde5850fb454bca7bd8",
+        "fa2a355e01757c1086df79d4f21bfdaeb3bc052fbcf06b6e625364425b558fbe"
+      ]
+    },
+    {
+      "name": "different_modality",
+      "block_size_tokens": 4,
+      "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "image:abc123",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "76903ac4dc08cbc3f562ff011ce0fc7bbc79a61e4e1f6dac0549cb32f5c88860",
+        "637d8500db4972d9395ea37cd1997294d648153dea435ddb7e63448927433b83"
+      ]
+    },
+    {
+      "name": "different_parent_chain",
+      "block_size_tokens": 4,
+      "tokens": [9, 2, 3, 4, 5, 6, 7, 8],
+      "isolation_key": {
+        "tenant_id": "tenant-a",
+        "tenant_salt": "salt-a",
+        "model_id": "qwen2.5-7b",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "5de3a05c0d40f2ddba229c137c23caa6892c2e0c94f1ed17377624a9add145a0",
+        "2f174e51abd420ca42d292db70a0bb835fae5b1f1240ef9d1fd44bb6e89915cf"
+      ]
+    },
+    {
+      "name": "delimiter_collision_a",
+      "block_size_tokens": 4,
+      "tokens": [10, 20, 30, 40],
+      "isolation_key": {
+        "tenant_id": "ab",
+        "tenant_salt": "salt-a",
+        "model_id": "c",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "317c8d423c7166248bde9b2a6a376c72fbddfa2063c5a438c9ea323c00de9f8d"
+      ]
+    },
+    {
+      "name": "delimiter_collision_b",
+      "block_size_tokens": 4,
+      "tokens": [10, 20, 30, 40],
+      "isolation_key": {
+        "tenant_id": "a",
+        "tenant_salt": "salt-a",
+        "model_id": "bc",
+        "model_revision": "rev-001",
+        "tokenizer_revision": "tok-001",
+        "lora_id": "none",
+        "modality_key": "text",
+        "cache_salt": "cache-v1"
+      },
+      "expected_hashes": [
+        "7041f0571eef265e7fc7990b9d8e5ca6783b39aa5c26524319562929487776b1"
+      ]
+    }
+  ]
+}

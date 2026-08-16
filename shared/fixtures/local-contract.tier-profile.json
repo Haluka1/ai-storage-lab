@@ -1,0 +1,25 @@
+{
+  "contract_version": 1,
+  "generated_at": "1970-01-01T00:00:00Z",
+  "env_id": "synthetic-contract-fixture-not-a-measurement",
+  "source_csv": "fixture-only.csv",
+  "provenance": {
+    "generator": "checked-in contract fixture",
+    "synthetic_contract_fixture": true
+  },
+  "profiles": {
+    "local_file_pread": {
+      "available": true,
+      "synthetic_contract_fixture": true,
+      "p50_ms": 1.0,
+      "p95_ms": 5.0,
+      "p99_ms": 9.0,
+      "bandwidth_MBps": 2048.0,
+      "page_cache_policy": "fixture",
+      "filesystem": "fixture",
+      "mount_options": "fixture",
+      "kernel": "fixture",
+      "driver": "posix"
+    }
+  }
+}

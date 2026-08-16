@@ -1,0 +1,74 @@
+{
+  "cases": [
+    {
+      "engine": "buffered",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "sequential",
+      "page_cache_policy": "warm"
+    },
+    {
+      "engine": "buffered",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "sequential",
+      "page_cache_policy": "coldish_fadvise_drop"
+    },
+    {
+      "engine": "pread",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "random",
+      "page_cache_policy": "warm"
+    },
+    {
+      "engine": "pread",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 4,
+      "iterations": 8,
+      "warmup": 2,
+      "access": "random",
+      "page_cache_policy": "warm"
+    },
+    {
+      "engine": "mmap",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "sequential",
+      "page_cache_policy": "warm"
+    },
+    {
+      "engine": "vectored",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "random",
+      "page_cache_policy": "warm"
+    },
+    {
+      "engine": "odirect",
+      "op": "read",
+      "block_size_kb": 256,
+      "threads": 1,
+      "iterations": 16,
+      "warmup": 4,
+      "access": "random",
+      "page_cache_policy": "direct"
+    }
+  ]
+}
