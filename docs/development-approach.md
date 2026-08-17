@@ -25,7 +25,7 @@ The maintainer's validation here means reviewing the selected code surface, runn
 
 ## Machine-enforced review
 
-`make test` compiles and tests the three implementation areas. `make demo` exercises a live loopback Router path. `make audit` checks local links, private-workspace/secret patterns, contract fixtures, and the repository's MIT license integrity. CI cleans generated files and checks worktree drift after all tasks.
+`make test` compiles and tests the three implementation areas. `make demos` exercises the live loopback Router path and the independent KV correctness walkthrough. `make audit` checks local links, private-workspace/secret patterns, contract fixtures, and the repository's MIT license integrity. CI cleans generated files and checks worktree drift after all tasks.
 
 These gates are intentionally deterministic and local. They do not invoke a model service, cloud API, cluster, or object endpoint.
 

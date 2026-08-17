@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import tempfile
 import threading
@@ -77,6 +78,37 @@ class TierManagerTest(unittest.TestCase):
                 self.assertTrue(store.tiers[TierName.MEMORY].contains(key))
             finally:
                 release.set()
+                store.close()
+
+    def test_async_prefetch_respects_requested_target_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            client = _FakeS3Client()
+            memory = MemoryTier(1024, meta)
+            nvme = NVMeTier(root / "nvme", 1024, meta)
+            s3 = S3Tier("bucket", "blocks", meta, client=client)
+            store = MultiTierKVBlockStore(
+                [memory, nvme, s3],
+                meta,
+                _PrefetchOnlyCostModel(TierName.S3),
+            )
+            key = _key("target")
+            store.store(
+                key,
+                b"payload",
+                _metadata(key, 4096, 7),
+                preferred_tier=TierName.S3,
+            )
+            try:
+                with self.assertRaisesRegex(BlockNotFound, "submitted"):
+                    store.load(key, target_tier=TierName.NVME)
+                deadline = time.monotonic() + 2
+                while not nvme.contains(key) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(nvme.contains(key))
+                self.assertFalse(memory.contains(key))
+            finally:
                 store.close()
 
     def test_nvme_load_promotes_to_memory(self) -> None:
@@ -161,7 +193,7 @@ def _store(root: Path) -> MultiTierKVBlockStore:
 
 
 def _key(seed: str) -> BlockKey:
-    return BlockKey("t", "m", "r", "tok", seed * 64)
+    return BlockKey("t", "m", "r", "tok", hashlib.sha256(seed.encode()).hexdigest())
 
 
 def _metadata(key: BlockKey, tokens: int, bytes_: int) -> KVMetadata:
@@ -169,8 +201,11 @@ def _metadata(key: BlockKey, tokens: int, bytes_: int) -> KVMetadata:
 
 
 class _PrefetchOnlyCostModel:
+    def __init__(self, source_tier: TierName = TierName.NVME):
+        self.source_tier = source_tier
+
     def decide(self, locations, ctx, slo_budget_ms=None):
-        return Decision("prefetch", TierName.NVME, 1.0, 2.0, 1.0, "test")
+        return Decision("prefetch", self.source_tier, 1.0, 2.0, 1.0, "test")
 
 
 class _FakeS3Client:

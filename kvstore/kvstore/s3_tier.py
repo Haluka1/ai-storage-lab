@@ -6,10 +6,11 @@ import struct
 import time
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from .checksum import sha256_hex, verify_sha256
-from .errors import BlockNotFound, ChecksumMismatch, MetadataMismatch, TierUnavailable
+from .errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch, TierUnavailable
+from .layout import storage_key_parts
 from .metadata import BlockKey, BlockLocation, KVMetadata, LoadResult, StoreResult, TierName
 from .metadata_store import MetadataStore
 from .metrics import KVStoreMetrics
@@ -125,18 +126,16 @@ class S3Tier:
             raise BlockNotFound(key.block_hash)
         if self.metadata_store.lookup_and_acquire(key, self.name) is None:
             raise BlockNotFound(key.block_hash)
-        evict_after_release = False
+        corruption_error: ChecksumMismatch | None = None
         try:
             header, payload = self._read_object(object_key)
             metadata = KVMetadata.from_dict(header["metadata"])
             if metadata.key != key:
                 raise MetadataMismatch(key.block_hash)
             if len(payload) != int(header["payload_bytes"]):
-                evict_after_release = True
                 self._metric(lambda m: m.kv_checksum_mismatch_total.inc(tier=self.name.value, outcome="error"))
                 raise ChecksumMismatch(key.block_hash)
             if not verify_sha256(payload, str(header["checksum"])):
-                evict_after_release = True
                 self._metric(lambda m: m.kv_checksum_mismatch_total.inc(tier=self.name.value, outcome="error"))
                 raise ChecksumMismatch(key.block_hash)
             metadata.checksum = str(header["checksum"])
@@ -148,13 +147,27 @@ class S3Tier:
             self._metric(lambda m: m.kv_load_latency_seconds.observe(latency_ms / 1000.0, tier=self.name.value, outcome="ok"))
             self._metric(lambda m: m.kv_bytes_read_total.inc(len(payload), tier=self.name.value, outcome="ok"))
             return LoadResult(key, self.name, payload, metadata, latency_ms)
-        except ChecksumMismatch:
-            evict_after_release = True
+        except ChecksumMismatch as exc:
+            corruption_error = exc
             raise
         finally:
-            self.metadata_store.release(key, self.name)
-            if evict_after_release:
-                self.evict(key)
+            try:
+                self.metadata_store.release(key, self.name)
+            except Exception as cleanup_error:
+                if corruption_error is not None:
+                    raise CorruptionCleanupFailed(
+                        key.block_hash, "release", cleanup_error
+                    ) from corruption_error
+                raise
+            if corruption_error is not None:
+                try:
+                    removed = self.evict(key)
+                    if not removed and self.metadata_store.lookup(key, self.name):
+                        raise RuntimeError("corrupt S3 location remains active")
+                except Exception as cleanup_error:
+                    raise CorruptionCleanupFailed(
+                        key.block_hash, "evict", cleanup_error
+                    ) from corruption_error
 
     def evict(self, key: BlockKey) -> bool:
         with self.metadata_store.mutation():
@@ -196,17 +209,7 @@ class S3Tier:
         return data
 
     def object_key(self, key: BlockKey) -> str:
-        parts = [
-            _escape(key.tenant_id),
-            _escape(key.model_id),
-            _escape(key.model_revision),
-            _escape(key.tokenizer_revision),
-            _escape(key.lora_id or "none"),
-            _escape(key.modality_key or "text"),
-            key.block_hash[:2],
-            f"{key.block_hash}.kv",
-        ]
-        path = str(PurePosixPath(*parts))
+        path = str(PurePosixPath(*storage_key_parts(key)))
         return f"{self.prefix}/{path}" if self.prefix else path
 
     def _delete_target(self, location: BlockLocation) -> tuple[str, str]:
@@ -295,10 +298,6 @@ class S3Tier:
             aws_secret_access_key=os.environ.get(secret_key_env),
             config=config,
         )
-
-
-def _escape(value: str) -> str:
-    return quote(value, safe="")
 
 
 def _read_body(body: Any) -> bytes:

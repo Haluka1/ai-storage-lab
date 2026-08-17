@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"ai-inference-storage-showcase/router/internal/cacheindex"
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/cacheindex"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type cacheEvent struct {
@@ -40,6 +40,9 @@ func (h *Handler) cacheIndexEvent(event cacheEvent) (cacheindex.Event, error) {
 		if indexEvent.BlockHash == "" || indexEvent.WorkerID == "" {
 			return cacheindex.Event{}, errors.New("block_hash and worker_id are required")
 		}
+		if indexEvent.SeqNo <= 0 {
+			return cacheindex.Event{}, errors.New("seq_no must be positive for admin events")
+		}
 		return indexEvent, nil
 	case "block_stored":
 		if event.Tokens < 0 {
@@ -58,6 +61,9 @@ func (h *Handler) cacheIndexEvent(event cacheEvent) (cacheindex.Event, error) {
 			if indexEvent.Tokens == 0 {
 				indexEvent.Tokens = h.hasher.BlockSizeTokens
 			}
+			if indexEvent.SeqNo <= 0 {
+				return cacheindex.Event{}, errors.New("seq_no must be positive for admin events")
+			}
 			return indexEvent, nil
 		}
 		location := *event.Location
@@ -66,6 +72,9 @@ func (h *Handler) cacheIndexEvent(event cacheEvent) (cacheindex.Event, error) {
 		}
 		if err := validateBlockLocation(location); err != nil {
 			return cacheindex.Event{}, err
+		}
+		if indexEvent.SeqNo <= 0 {
+			return cacheindex.Event{}, errors.New("seq_no must be positive for admin events")
 		}
 		indexEvent.Location = &location
 		return indexEvent, nil

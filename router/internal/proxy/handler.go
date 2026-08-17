@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,12 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/blockhash"
-	"ai-inference-storage-showcase/router/internal/cacheindex"
-	"ai-inference-storage-showcase/router/internal/common"
-	"ai-inference-storage-showcase/router/internal/routing"
+	"github.com/Haluka1/ai-storage-lab/router/internal/blockhash"
+	"github.com/Haluka1/ai-storage-lab/router/internal/cacheindex"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/routing"
 )
 
 const (
@@ -28,6 +30,8 @@ const (
 	actualHitBlocksJSONKey  = "actual_hit_blocks"
 	actualMissBlocksJSONKey = "actual_miss_blocks"
 )
+
+var generatedRequestCounter atomic.Uint64
 
 type Handler struct {
 	runID          string
@@ -296,7 +300,7 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
-	requestNonce := headerOrDefault(r, "X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
+	requestNonce := ensureRequestID(r)
 	traceCtx := traceContextFromRequest(r.Header.Get("traceparent"), requestNonce)
 	routerStart := time.Now()
 	routerSpan := h.traceLog.WriteSpan(h.runID, traceCtx, "router_receive", "", routerStart, "ok", map[string]any{
@@ -435,7 +439,7 @@ func (h *Handler) proxyToWorker(w http.ResponseWriter, r *http.Request, body []b
 			"error_class":     "upstream_round_trip",
 		})
 		h.metrics.ObserveRoute(decision.Strategy, "proxy_error", hashPrefix(string(decision.WorkerID)), 0)
-		writeText(w, http.StatusBadGateway, sanitizeHTTPError(err)+"\n")
+		writeText(w, http.StatusBadGateway, "upstream request failed\n")
 		return err
 	}
 	defer resp.Body.Close()
@@ -515,7 +519,7 @@ func (h *Handler) buildRequestContext(r *http.Request, body []byte) (common.Requ
 		blockHashes = append(blockHashes, common.BlockHash(block))
 	}
 	timings.BlockHash = time.Since(hashStart)
-	requestID := headerOrDefault(r, "X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
+	requestID := ensureRequestID(r)
 	tenantID := headerOrDefault(r, "X-Tenant-ID", "default-tenant")
 	return common.RequestContext{
 		RequestID:            requestID,
@@ -759,19 +763,46 @@ func joinWorkerURL(workerURL string, original *url.URL) (string, error) {
 
 func cloneProxyHeaders(headers http.Header) http.Header {
 	out := headers.Clone()
-	for _, name := range []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		out.Del(name)
-	}
+	removeHopByHopHeaders(out)
 	return out
 }
 
 func setRequestCorrelationHeaders(headers http.Header, r *http.Request) {
+	requestID := ensureRequestID(r)
 	if traceID := traceIDFromTraceparent(r.Header.Get("traceparent")); traceID != "" {
 		headers.Set("X-Trace-Id", traceID)
-		return
 	}
-	requestID := headerOrDefault(r, "X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
 	headers.Set("X-Request-Hash", hashPrefix(requestID))
+}
+
+func ensureRequestID(r *http.Request) string {
+	if requestID := strings.TrimSpace(r.Header.Get("X-Request-ID")); requestID != "" {
+		return requestID
+	}
+	random := make([]byte, 16)
+	requestID := ""
+	if _, err := rand.Read(random); err == nil {
+		requestID = hex.EncodeToString(random)
+	} else {
+		requestID = fmt.Sprintf(
+			"%d-%d", time.Now().UnixNano(), generatedRequestCounter.Add(1),
+		)
+	}
+	r.Header.Set("X-Request-ID", requestID)
+	return requestID
+}
+
+func removeHopByHopHeaders(headers http.Header) {
+	for _, connectionValue := range headers.Values("Connection") {
+		for _, token := range strings.Split(connectionValue, ",") {
+			if name := strings.TrimSpace(token); name != "" {
+				headers.Del(name)
+			}
+		}
+	}
+	for _, name := range []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		headers.Del(name)
+	}
 }
 
 func traceIDFromTraceparent(value string) string {
@@ -795,7 +826,9 @@ func traceIDFromTraceparent(value string) string {
 }
 
 func copyResponseHeaders(dst http.Header, src http.Header) {
-	for key, values := range src {
+	clean := src.Clone()
+	removeHopByHopHeaders(clean)
+	for key, values := range clean {
 		for _, value := range values {
 			dst.Add(key, value)
 		}
@@ -908,15 +941,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
-}
-
-func sanitizeHTTPError(err error) string {
-	if err == nil {
-		return ""
-	}
-	text := strings.ReplaceAll(err.Error(), "\n", " ")
-	if len(text) > 240 {
-		return text[:240]
-	}
-	return text
 }

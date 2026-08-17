@@ -107,13 +107,26 @@ def _handler_for(worker_id: str) -> type[BaseHTTPRequestHandler]:
 
 def _start_workers() -> list[tuple[ThreadingHTTPServer, threading.Thread]]:
     workers: list[tuple[ThreadingHTTPServer, threading.Thread]] = []
-    for worker_id, port in WORKERS.items():
-        server = ThreadingHTTPServer(("127.0.0.1", port), _handler_for(worker_id))
-        server.daemon_threads = True
-        thread = threading.Thread(target=server.serve_forever, name=worker_id, daemon=True)
-        thread.start()
-        workers.append((server, thread))
-    return workers
+    try:
+        for worker_id, port in WORKERS.items():
+            server = ThreadingHTTPServer(("127.0.0.1", port), _handler_for(worker_id))
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, name=worker_id, daemon=True)
+            thread.start()
+            workers.append((server, thread))
+        return workers
+    except BaseException:
+        _stop_workers(workers)
+        raise
+
+
+def _stop_workers(
+    workers: list[tuple[ThreadingHTTPServer, threading.Thread]],
+) -> None:
+    for server, thread in workers:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _config(strategy: str) -> dict[str, Any]:
@@ -168,7 +181,12 @@ def _build_router(binary: Path, cache_dir: Path) -> None:
     )
 
 
-def _start_router(binary: Path, config_path: Path, log_file: Any) -> subprocess.Popen[bytes]:
+def _start_router(
+    binary: Path,
+    config_path: Path,
+    log_file: Any,
+    readiness_timeout_seconds: float = 5.0,
+) -> subprocess.Popen[bytes]:
     env = os.environ.copy()
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
@@ -179,20 +197,26 @@ def _start_router(binary: Path, config_path: Path, log_file: Any) -> subprocess.
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            log_file.seek(0)
-            details = log_file.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Router exited before readiness:\n{details}")
-        try:
-            status, _, _ = _request(ADMIN_PORT, "GET", "/readyz")
-            if status == 200:
-                return process
-        except OSError:
-            pass
-        time.sleep(0.05)
-    raise RuntimeError("Router did not become ready within 5 seconds")
+    try:
+        deadline = time.monotonic() + readiness_timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                log_file.seek(0)
+                details = log_file.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Router exited before readiness:\n{details}")
+            try:
+                status, _, _ = _request(ADMIN_PORT, "GET", "/readyz")
+                if status == 200:
+                    return process
+            except OSError:
+                pass
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"Router did not become ready within {readiness_timeout_seconds:g} seconds"
+        )
+    except BaseException:
+        _stop_router(process)
+        raise
 
 
 def _stop_router(process: subprocess.Popen[bytes] | None) -> None:
@@ -347,10 +371,7 @@ def main() -> int:
         return 1
     finally:
         _stop_router(router_process)
-        for server, thread in workers:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
+        _stop_workers(workers)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/blockhash"
-	"ai-inference-storage-showcase/router/internal/cacheindex"
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/blockhash"
+	"github.com/Haluka1/ai-storage-lab/router/internal/cacheindex"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 func TestProxyStreamsToSelectedWorkerAndLogsRedactedDecision(t *testing.T) {
@@ -199,7 +200,7 @@ func TestAdminBlockStoredEventCanInfluencePrefixRouting(t *testing.T) {
 
 	prompt := "hot prefix token reuse"
 	block := firstBlockForPrompt(t, prompt)
-	eventBody := `{"event_type":"block_stored","worker_id":"worker-b","block_hash":"` + block + `","tier":"gpu","tokens":16}`
+	eventBody := `{"event_type":"block_stored","worker_id":"worker-b","block_hash":"` + block + `","tier":"gpu","tokens":16,"seq_no":1}`
 	eventReq := httptest.NewRequest(http.MethodPost, "/admin/events", strings.NewReader(eventBody))
 	eventRec := httptest.NewRecorder()
 	handler.AdminHandler().ServeHTTP(eventRec, eventReq)
@@ -215,6 +216,107 @@ func TestAdminBlockStoredEventCanInfluencePrefixRouting(t *testing.T) {
 	}
 	if got := rt.lastHeader.Get("X-Router-Worker-ID"); got != "worker-b" {
 		t.Fatalf("expected prefix_hash to choose worker-b, got %q", got)
+	}
+}
+
+func TestAdminEventRejectsZeroSequence(t *testing.T) {
+	handler := newTestHandler(t, filepath.Join(t.TempDir(), "decisions.jsonl"), "cost_aware")
+	defer handler.Close()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/events",
+		strings.NewReader(`{"event_type":"block_stored","worker_id":"worker-a","block_hash":"abc","tier":"gpu","tokens":16,"seq_no":0}`),
+	)
+	rec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "seq_no must be positive") {
+		t.Fatalf("zero sequence status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGeneratedRequestIdentityIsConsistentAcrossOutputs(t *testing.T) {
+	td := t.TempDir()
+	cfg := testConfig(td, "cost_aware")
+	handler, err := NewHandler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &captureRoundTripper{body: `{"choices":[{"text":"ok"}]}`}
+	handler.SetHTTPClient(&http.Client{Transport: rt})
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"m","prompt":"generated identity","max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if err := handler.Close(); err != nil {
+		t.Fatal(err)
+	}
+	responseHash := rec.Header().Get("X-Request-Hash")
+	for label, got := range map[string]string{
+		"response router hash": rec.Header().Get("X-Router-Request-Hash"),
+		"upstream router hash": rt.lastHeader.Get("X-Router-Request-Hash"),
+	} {
+		if responseHash == "" || got != responseHash {
+			t.Fatalf("%s=%q, response correlation hash=%q", label, got, responseHash)
+		}
+	}
+	raw, err := os.ReadFile(cfg.Router.DecisionLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decision map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &decision); err != nil {
+		t.Fatal(err)
+	}
+	if got := decision["request_id_hash"]; got != responseHash {
+		t.Fatalf("decision request hash=%v, want %q", got, responseHash)
+	}
+	for _, record := range readTraceRecords(t, cfg.Router.TraceLogPath) {
+		attributes, _ := record["attributes"].(map[string]any)
+		if got, ok := attributes["request_id_hash"]; ok && got != responseHash {
+			t.Fatalf("trace request hash=%v, want %q in %+v", got, responseHash, record)
+		}
+	}
+}
+
+func TestUpstreamTransportErrorDoesNotExposeWorkerEndpoint(t *testing.T) {
+	handler := newTestHandler(t, filepath.Join(t.TempDir(), "decisions.jsonl"), "cost_aware")
+	handler.SetHTTPClient(&http.Client{Transport: errorRoundTripper{
+		err: errors.New("dial tcp 203.0.113.8:9000 for http://worker.example.invalid"),
+	}})
+	defer handler.Close()
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"m","prompt":"transport error","max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || rec.Body.String() != "upstream request failed\n" {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	for _, forbidden := range []string{"203.0.113.8", "worker.example.invalid", "worker-a.local", "worker-b.local"} {
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Fatalf("public error leaked %q: %q", forbidden, rec.Body.String())
+		}
+	}
+}
+
+func TestProxyRemovesDynamicHopByHopHeaders(t *testing.T) {
+	handler := newTestHandler(t, filepath.Join(t.TempDir(), "decisions.jsonl"), "cost_aware")
+	rt := &captureRoundTripper{
+		body: `{"choices":[]}`,
+		headers: http.Header{
+			"Connection":     []string{"X-Upstream-Hop"},
+			"X-Upstream-Hop": []string{"private"},
+		},
+	}
+	handler.SetHTTPClient(&http.Client{Transport: rt})
+	defer handler.Close()
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"m","prompt":"headers","max_tokens":1}`))
+	req.Header.Set("Connection", "X-Client-Hop")
+	req.Header.Set("X-Client-Hop", "private")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if got := rt.lastHeader.Get("X-Client-Hop"); got != "" {
+		t.Fatalf("request hop-by-hop header reached upstream: %q", got)
+	}
+	if got := rec.Header().Get("X-Upstream-Hop"); got != "" {
+		t.Fatalf("response hop-by-hop header reached client: %q", got)
 	}
 }
 
@@ -368,7 +470,7 @@ func TestAdminDrainUndrainStopsNewRoutingToWorker(t *testing.T) {
 
 	prompt := "hot prefix token reuse"
 	block := firstBlockForPrompt(t, prompt)
-	eventBody := `{"event_type":"block_stored","worker_id":"worker-a","block_hash":"` + block + `","tier":"gpu","tokens":16}`
+	eventBody := `{"event_type":"block_stored","worker_id":"worker-a","block_hash":"` + block + `","tier":"gpu","tokens":16,"seq_no":1}`
 	eventReq := httptest.NewRequest(http.MethodPost, "/admin/events", strings.NewReader(eventBody))
 	eventRec := httptest.NewRecorder()
 	handler.AdminHandler().ServeHTTP(eventRec, eventReq)
@@ -733,6 +835,14 @@ func (s *selectionBarrierStrategy) Pick(ctx context.Context, req common.RequestC
 
 type notifyingRoundTripper struct {
 	called chan<- struct{}
+}
+
+type errorRoundTripper struct {
+	err error
+}
+
+func (rt errorRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return nil, rt.err
 }
 
 func (rt *notifyingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {

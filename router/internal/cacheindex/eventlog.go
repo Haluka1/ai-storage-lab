@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type Event struct {
@@ -107,7 +107,7 @@ func (idx *Index) ApplyEvent(event Event) error {
 			if loc.BlockHash == "" {
 				loc.BlockHash = event.BlockHash
 			}
-			idx.storeLocationLocked(loc, true)
+			idx.storeLocationLocked(loc, true, event.SeqNo > 0)
 			return nil
 		}
 		loc := common.BlockLocation{
@@ -130,7 +130,7 @@ func (idx *Index) ApplyEvent(event Event) error {
 		if loc.Tokens <= 0 {
 			loc.Tokens = 16
 		}
-		idx.storeLocationLocked(loc, true)
+		idx.storeLocationLocked(loc, true, event.SeqNo > 0)
 		return nil
 	case "block_evicted":
 		idx.evictLocked(event.BlockHash, event.WorkerID, event.SeqNo, true)

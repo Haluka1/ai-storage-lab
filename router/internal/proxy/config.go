@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type Config struct {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"ai-inference-storage-showcase/router/internal/cacheindex"
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/cacheindex"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 var ErrNoHealthyWorker = errors.New("no healthy worker available")

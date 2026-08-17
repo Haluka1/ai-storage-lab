@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type Index struct {
@@ -33,7 +33,6 @@ func New(ttl time.Duration) *Index {
 func (idx *Index) Store(block common.BlockHash, worker common.WorkerID, tier common.Tier, tokens int) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.nextSeqNo++
 	now := idx.now()
 	idx.storeLocationLocked(common.BlockLocation{
 		BlockHash:              block,
@@ -45,20 +44,20 @@ func (idx *Index) Store(block common.BlockHash, worker common.WorkerID, tier com
 		EstimatedTransferP95Ms: 0,
 		EgressCostClass:        "none",
 		Tokens:                 tokens,
-		SeqNo:                  idx.nextSeqNo,
+		SeqNo:                  0,
 		Confidence:             1.0,
 		UpdatedAt:              now,
 		ExpiresAt:              now.Add(idx.ttl),
-	}, false)
+	}, false, false)
 }
 
 func (idx *Index) StoreLocation(loc common.BlockLocation) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.storeLocationLocked(loc, true)
+	idx.storeLocationLocked(loc, true, loc.SeqNo > 0)
 }
 
-func (idx *Index) storeLocationLocked(loc common.BlockLocation, rejectStale bool) bool {
+func (idx *Index) storeLocationLocked(loc common.BlockLocation, rejectStale bool, producerOrdered bool) bool {
 	idx.nextSeqNo++
 	now := idx.now()
 	if loc.SeqNo == 0 {
@@ -84,7 +83,7 @@ func (idx *Index) storeLocationLocked(loc common.BlockLocation, rejectStale bool
 	if loc.EgressCostClass == "" {
 		loc.EgressCostClass = "unknown"
 	}
-	if rejectStale && !idx.seqFreshLocked(loc.WorkerID, loc.SeqNo) {
+	if rejectStale && producerOrdered && !idx.seqFreshLocked(loc.WorkerID, loc.SeqNo) {
 		return false
 	}
 	locations := idx.byBlock[loc.BlockHash]
@@ -93,7 +92,9 @@ func (idx *Index) storeLocationLocked(loc common.BlockLocation, rejectStale bool
 		idx.byBlock[loc.BlockHash] = locations
 	}
 	locations[loc.WorkerID] = loc
-	idx.markWorkerSeqLocked(loc.WorkerID, loc.SeqNo)
+	if producerOrdered {
+		idx.markWorkerSeqLocked(loc.WorkerID, loc.SeqNo)
+	}
 	return true
 }
 

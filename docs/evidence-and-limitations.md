@@ -9,7 +9,7 @@ They are not production QPS, SLO, availability, HA, or current-HEAD equivalence 
 ## Historical H20 dual-Worker Router summary
 
 - Recorded outcome: **512/512** completed, with **four scenarios reported as 64/64 each** in the retained summary.
-- What it supports: a Router/fake-or-real-upstream functional request path was exercised on that historical setup.
+- What it supports: the retained private summary records two real vLLM Workers on H20 and completed Router requests. Because the raw artifacts are not public, this is self-reported historical functional context only.
 - What it does not support: throughput gain, optimal load balance, production telemetry, automatic failover, or proof of every behavior in the current revision.
 - Provenance caveat: the raw private artifacts are not published and the summary does not provide a source revision that can be mapped confidently to current HEAD.
 

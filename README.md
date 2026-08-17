@@ -36,8 +36,8 @@ The dashed line is deliberately not a call arrow: Router cache metadata and KVSt
 
 ## What is implemented
 
-- **Go Router:** completion/chat subset parsing and proxying, deterministic approximate tokenization, namespace-isolated chained block hashes, CacheIndex TTL/event/sequence handling, routable Worker filtering, round-robin/cache-aware/cost-aware strategies, post-pick locked revalidation, Router-owned inflight lifecycle accounting, drain/remove checks, streaming proxying, and bounded/redacted observability.
-- **Python KVStore protocol:** full namespace keys, memory and file-backed tiers, an optional S3-compatible client boundary, payload-first/metadata-last stores, identity/length/checksum validation, atomic lookup-and-acquire/release, single-process owner locking and epoch cleanup, deleting tombstones, segmented append/compaction, prefetch/eviction, and load/prefetch/recompute decisions.
+- **Go Router:** completion/chat subset parsing and proxying, deterministic approximate tokenization, namespace-isolated chained block hashes, CacheIndex TTL/event/sequence handling, routable Worker filtering, round-robin/cache-aware/cost-aware strategies, post-pick locked revalidation, Router-owned inflight lifecycle accounting, drain/remove checks, streaming proxying, and hashed request/tenant identifiers. Opt-in decision logs retain Worker/control-plane metadata for debugging.
+- **Python KVStore protocol:** validated, injectively encoded full namespace keys, memory and file-backed tiers, an optional S3-compatible client boundary, payload-first/metadata-last stores, identity/length/checksum validation, atomic lookup-and-acquire/release, single-process owner locking and epoch cleanup, deleting tombstones, segmented append/compaction, target-aware prefetch/eviction, and load/prefetch/recompute decisions.
 - **Local I/O Profile:** C++17 buffered, `pread`, `mmap`, vectored, and `O_DIRECT` read paths; a small matrix runner; a versioned JSON Schema; a profile generator; and a tested importer into the KV cost model.
 
 ## Quick start
@@ -58,7 +58,7 @@ Tests and demos do not contact an external endpoint. `make demo` uses loopback p
 ## Design highlights
 
 - The Router's block identity chains each block to its parent and includes tenant/model/tokenizer/adapter/modality/cache-salt namespace fields. It is stable for this repository's approximation, not authoritative model-engine identity.
-- CacheIndex filters expired observations, deduplicates non-empty event IDs, and requires positive `ApplyEvent` sequence numbers to advance per Worker; sequence zero is the explicitly unordered local mode.
+- CacheIndex filters expired observations, deduplicates non-empty event IDs, and requires positive producer sequences to advance per Worker. Sequence zero is an internal unordered local mode and is rejected by the admin event API.
 - Selection is advisory until the Router reacquires the Worker lock, revalidates routability, and increments Router-owned inflight lifecycle accounting. This count does not reserve Worker compute, memory, or KV capacity, and the proxy does not retry a failed upstream/stream on another Worker.
 - File-backed and S3-compatible stores publish payload before metadata. Loads reacquire metadata and recheck the complete key, byte length, and checksum.
 - Deletion becomes logically visible through a tombstone before physical cleanup; append-only segment bytes are reclaimed only when a caller explicitly runs synchronous compaction.
@@ -85,11 +85,11 @@ It prints the selected Worker, strategy, and redacted request hash for every dec
 | `make test-router` | format check, build, vet, unit/contract tests, and race tests |
 | `make test-kv` | protocol, tier, owner-epoch, tombstone, corruption, and compaction tests |
 | `make test-io` | C++ build plus five-engine smoke and profile-contract tests |
-| `make test-demo` | loopback port-conflict and immediate-rerun regression tests |
+| `make test-demo` | loopback port-conflict, immediate-rerun, and failure-cleanup regression tests |
 | `make audit` | local Markdown links, privacy/secret patterns, tier-profile Schema, and license status |
 | `make test` | all three CPU test suites |
 
-CI runs the same commands, the Router Demo, cleanup, and a final Git worktree-drift check.
+CI runs the same commands, both local Demos, cleanup, and a final Git worktree-drift check on Python 3.10 and 3.12.
 
 ## Evidence
 
@@ -108,6 +108,7 @@ The checked-in tier-profile fixture is synthetic contract data, not benchmark ev
 - Router-owned inflight is single-Router lifecycle accounting, not a capacity reservation. Once an upstream attempt starts—especially after stream bytes are written—the Router does not retry it elsewhere.
 - No RDMA, NIXL, GDS, CXL, or SPDK data plane is implemented.
 - `MemoryTier` means host memory, not HBM. The historical `NVMeTier` class name wraps a file-backed abstraction and is not a validated production NVMe engine.
+- The file-backed tier does not implement `O_DIRECT`; requesting it fails explicitly. `O_DIRECT` exists only in the independent I/O Profile measurement module.
 - File-backed stores default to no strong durable commit guarantee across sudden power loss.
 - The SQLite owner lock is single-process coordination, not a distributed lease.
 - Segment compaction is an explicit synchronous maintenance call, not an online background compactor. A checksum mismatch is surfaced and invalidates the bad location; it is not automatically converted into recomputation.

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import tempfile
 import unittest
 from pathlib import Path
 
-from kvstore.errors import BlockNotFound, ChecksumMismatch, TierUnavailable
+from kvstore.errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, TierUnavailable
+from kvstore.layout import storage_key_parts
 from kvstore.metadata import BlockKey, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
 from kvstore.s3_fault_injection import FaultInjectingS3Client, S3FaultInjectionConfig, S3InjectedTimeout
@@ -56,14 +58,31 @@ class S3TierTest(unittest.TestCase):
                 tier.load(key)
             self.assertIsNone(tier.lookup(key))
 
+    def test_corruption_cleanup_failure_is_not_reclassified_as_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("cleanup")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            client.objects[("bucket", object_key)] = (
+                client.objects[("bucket", object_key)][:-1] + b"x"
+            )
+            client.delete_failures_remaining = 1
+            with self.assertRaises(CorruptionCleanupFailed) as ctx:
+                tier.load(key)
+            self.assertEqual(ctx.exception.operation, "evict")
+            self.assertIsInstance(ctx.exception.__cause__, ChecksumMismatch)
+            self.assertTrue(meta.is_deleting(key, TierName.S3))
+
     def test_object_key_includes_namespace_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tier = S3Tier("bucket", "blocks", MetadataStore(Path(td) / "meta.sqlite3"), client=FakeS3Client())
             key = BlockKey("tenant/a", "model", "rev", "tok", "d" * 64, lora_id="adapter", modality_key="image")
             object_key = tier.object_key(key)
-            self.assertIn("tenant%2Fa", object_key)
-            self.assertIn("adapter", object_key)
-            self.assertIn("image", object_key)
+            self.assertEqual(object_key.split("/")[1:], storage_key_parts(key))
+            self.assertNotIn("tenant/a", object_key)
 
     def test_fault_injection_times_out_selected_operation(self) -> None:
         client = FaultInjectingS3Client(
@@ -200,7 +219,7 @@ class FakeNotFound(Exception):
 
 
 def _key(seed: str) -> BlockKey:
-    return BlockKey("t", "m", "r", "tok", seed * 64)
+    return BlockKey("t", "m", "r", "tok", hashlib.sha256(seed.encode()).hexdigest())
 
 
 def _metadata(key: BlockKey, bytes_: int) -> KVMetadata:

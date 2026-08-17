@@ -53,13 +53,16 @@ The checked-in fixture is synthetic contract input. It is not a hardware result 
 ## Current boundary
 
 - The Router uses deterministic approximate tokenization in its live request path; the approximation is not engine-accurate tokenization or KV identity.
-- Cache-event idempotence applies to non-empty event IDs, and ordered delivery checks apply to positive per-Worker sequence numbers. Sequence zero is accepted as unordered. Expired locations and remembered event IDs are not continuously garbage-collected in-process.
+- Cache-event idempotence applies to non-empty event IDs, and ordered delivery checks apply to positive per-Worker producer sequence numbers. Sequence zero is an internal unordered mode that does not advance the producer watermark; the admin event API requires a positive sequence. Expired locations and remembered event IDs are not continuously garbage-collected in-process.
 - Cache events and Worker metrics are supplied by config/admin calls. There is no production telemetry pipeline or automatic Worker discovery.
 - Drain and locked revalidation prevent new unsafe reservations; they do not implement transparent retry or automatic failover.
 - `MemoryTier` uses host memory. `NVMeTier` is a retained API name for a file-backed abstraction.
+- `BlockKey` validates bounded namespace fields and a lowercase SHA-256 block hash. SQLite uses a versioned canonical JSON identity, while file and S3-compatible layouts share safe encoded components.
+- The file-backed tier does not implement direct I/O; `use_direct_io=True` fails explicitly instead of becoming a silent configuration no-op.
+- Encoded components and a resolved descendant check reject input-driven traversal and existing symlink escape. The configured root is still a trusted local directory, not a hostile multi-user filesystem sandbox with `openat`/no-follow guarantees.
 - The file tier defaults to `fsync_on_store=False`; it does not promise strong commit durability after abrupt power loss.
 - SQLite owner epoch and `flock` enforce one live process per metadata database, not a distributed lease.
 - The S3-compatible boundary is covered with local fakes/fault injection. Default tests do not contact an object service.
-- Corruption remains an explicit checksum error after invalidating the location; only the tested S3-unavailable path is converted to a miss-like recompute result by the tier manager.
+- Corruption remains an explicit checksum error after invalidating the location. If invalidation itself fails, `CorruptionCleanupFailed` preserves the corruption classification and cleanup cause; only the tested S3-unavailable load path becomes a miss-like recompute result.
 - Segment compaction is a caller-invoked synchronous maintenance operation under local locks, not an online background service.
 - Topology and transport values are metadata consumed by a cost function. They do not implement a specialized transfer data plane.

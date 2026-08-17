@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type DecisionLogger struct {

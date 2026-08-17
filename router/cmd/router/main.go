@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/proxy"
+	"github.com/Haluka1/ai-storage-lab/router/internal/proxy"
 )
 
 func main() {

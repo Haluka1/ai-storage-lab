@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import socket
+import tempfile
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from run_demo import _assert_ports_available
+from run_demo import _assert_ports_available, _start_router, _start_workers
 
 
 class DemoPortCheckTest(unittest.TestCase):
@@ -45,6 +48,36 @@ class DemoPortCheckTest(unittest.TestCase):
 
         # A probe using the same reuse semantics must succeed immediately.
         _assert_ports_available((port,))
+
+    def test_router_readiness_timeout_stops_started_process(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with tempfile.TemporaryFile() as log_file:
+            with (
+                mock.patch("run_demo.subprocess.Popen", return_value=process),
+                mock.patch("run_demo._request", side_effect=OSError("not ready")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    _start_router(
+                        Path("/tmp/fake-router"),
+                        Path("/tmp/fake-config"),
+                        log_file,
+                        readiness_timeout_seconds=0.01,
+                    )
+        process.send_signal.assert_called_once()
+        process.wait.assert_called_once()
+
+    def test_partial_worker_start_failure_cleans_started_worker(self) -> None:
+        first_server = mock.Mock()
+        with mock.patch(
+            "run_demo.ThreadingHTTPServer",
+            side_effect=[first_server, OSError("second bind failed")],
+        ):
+            with self.assertRaisesRegex(OSError, "second bind failed"):
+                _start_workers()
+        first_server.shutdown.assert_called_once()
+        first_server.server_close.assert_called_once()
 
 
 if __name__ == "__main__":

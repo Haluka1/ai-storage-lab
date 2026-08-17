@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import json
+import re
 from typing import Any
 import time
+
+
+MAX_IDENTITY_COMPONENT_BYTES = 128
+_BLOCK_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TierName(str, Enum):
@@ -22,12 +28,59 @@ class BlockKey:
     lora_id: str = ""
     modality_key: str = ""
 
-    def namespace(self) -> str:
-        return (
-            f"tenant={self.tenant_id}/model={self.model_id}/"
-            f"revision={self.model_revision}/tokenizer={self.tokenizer_revision}/"
-            f"lora={self.lora_id or 'none'}/modality={self.modality_key or 'text'}"
+    def __post_init__(self) -> None:
+        required = {
+            "tenant_id": self.tenant_id,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "tokenizer_revision": self.tokenizer_revision,
+        }
+        for name, value in required.items():
+            _validate_identity_component(name, value, allow_empty=False)
+        _validate_identity_component("lora_id", self.lora_id, allow_empty=True)
+        _validate_identity_component(
+            "modality_key", self.modality_key, allow_empty=True
         )
+        if not isinstance(self.block_hash, str) or not _BLOCK_HASH_RE.fullmatch(
+            self.block_hash
+        ):
+            raise ValueError("block_hash must be 64 lowercase hexadecimal characters")
+
+    def namespace(self) -> str:
+        """Return the versioned, injective SQLite namespace identity.
+
+        A JSON array is deliberate: field boundaries and empty optional values
+        cannot collide with user-controlled delimiter text.
+        """
+
+        return json.dumps(
+            [
+                "kv-block-key-v1",
+                self.tenant_id,
+                self.model_id,
+                self.model_revision,
+                self.tokenizer_revision,
+                self.lora_id,
+                self.modality_key,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
+def _validate_identity_component(
+    name: str, value: str, *, allow_empty: bool
+) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if not allow_empty and not value:
+        raise ValueError(f"{name} must not be empty")
+    if len(value.encode("utf-8")) > MAX_IDENTITY_COMPONENT_BYTES:
+        raise ValueError(
+            f"{name} must be at most {MAX_IDENTITY_COMPONENT_BYTES} UTF-8 bytes"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{name} must not contain control characters")
 
 
 @dataclass

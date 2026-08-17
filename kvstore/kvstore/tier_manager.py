@@ -4,7 +4,7 @@ import threading
 from dataclasses import replace
 
 from .cost_model import CostModel, RequestContext
-from .errors import BlockNotFound, ChecksumMismatch, KVStoreError, TierUnavailable
+from .errors import BlockNotFound, KVStoreError, TierUnavailable
 from .interface import Tier
 from .metadata import BlockKey, BlockLocation, KVMetadata, LoadResult, StoreResult, TierName
 from .metadata_store import MetadataStore
@@ -63,7 +63,7 @@ class MultiTierKVBlockStore:
         decision = self.cost_model.decide(locations, ctx, slo_budget_ms=slo_budget_ms)
         self._metric(lambda m: m.kv_onload_decision_total.inc(tier=decision.tier.value, decision=decision.action, strategy="cost_based"))
         if decision.action == "prefetch":
-            submission = self._prefetcher.submit(key)
+            submission = self._prefetcher.submit(key, target_tier)
             self._metric(
                 lambda m: m.kv_prefetch_total.inc(
                     tier=target_tier.value, outcome=submission.reason
@@ -75,9 +75,6 @@ class MultiTierKVBlockStore:
         source = self.tiers[decision.tier]
         try:
             result = source.load(key)
-        except ChecksumMismatch:
-            source.evict(key)
-            raise
         except TierUnavailable as exc:
             if decision.tier == TierName.S3:
                 if is_timeout_exception(exc):

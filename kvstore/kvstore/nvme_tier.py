@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .checksum import sha256_hex, verify_sha256
-from .errors import BlockNotFound, ChecksumMismatch, MetadataMismatch, StoreFull
+from .errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch, StoreFull
 from .layout import ContentAddressedLayout, SegmentedLayout
 from .metadata import BlockKey, BlockLocation, KVMetadata, LoadResult, StoreResult, TierName
 from .metadata_store import MetadataStore
@@ -50,7 +50,11 @@ class NVMeTier:
             raise ValueError("layout_mode must be content_addressed or segment")
         if segment_bytes <= 0:
             raise ValueError("segment_bytes must be positive")
-        self.root_dir = Path(root_dir)
+        if use_direct_io:
+            raise NotImplementedError(
+                "FileBackedTier does not implement O_DIRECT; use io-profile for O_DIRECT measurement"
+            )
+        self.root_dir = Path(root_dir).expanduser().resolve(strict=False)
         self.max_bytes = max_bytes
         self.metadata_store = metadata_store
         self.fsync_on_store = fsync_on_store
@@ -174,14 +178,13 @@ class NVMeTier:
         loc = self.metadata_store.lookup_and_acquire(key, self.name)
         if loc is None:
             raise BlockNotFound(key.block_hash)
-        evict_after_release = False
+        corruption_error: ChecksumMismatch | None = None
         try:
             header, payload = self._read_location(loc)
             metadata = KVMetadata.from_dict(header["metadata"])
             if metadata.key != key:
                 raise MetadataMismatch(key.block_hash)
             if len(payload) != int(header["payload_bytes"]):
-                evict_after_release = True
                 self._metric(
                     lambda m: m.kv_checksum_mismatch_total.inc(
                         tier=self.name.value, outcome="error"
@@ -189,7 +192,6 @@ class NVMeTier:
                 )
                 raise ChecksumMismatch(key.block_hash)
             if not verify_sha256(payload, str(header["checksum"])):
-                evict_after_release = True
                 self._metric(
                     lambda m: m.kv_checksum_mismatch_total.inc(
                         tier=self.name.value, outcome="error"
@@ -215,13 +217,27 @@ class NVMeTier:
                 )
             )
             return LoadResult(key, self.name, payload, metadata, latency_ms)
-        except ChecksumMismatch:
-            evict_after_release = True
+        except ChecksumMismatch as exc:
+            corruption_error = exc
             raise
         finally:
-            self.metadata_store.release(key, self.name)
-            if evict_after_release:
-                self.evict(key)
+            try:
+                self.metadata_store.release(key, self.name)
+            except Exception as cleanup_error:
+                if corruption_error is not None:
+                    raise CorruptionCleanupFailed(
+                        key.block_hash, "release", cleanup_error
+                    ) from corruption_error
+                raise
+            if corruption_error is not None:
+                try:
+                    removed = self.evict(key)
+                    if not removed and self.metadata_store.lookup(key, self.name):
+                        raise RuntimeError("corrupt file location remains active")
+                except Exception as cleanup_error:
+                    raise CorruptionCleanupFailed(
+                        key.block_hash, "evict", cleanup_error
+                    ) from corruption_error
 
     def evict(self, key: BlockKey) -> bool:
         with self.metadata_store.mutation(), self._capacity_lock:

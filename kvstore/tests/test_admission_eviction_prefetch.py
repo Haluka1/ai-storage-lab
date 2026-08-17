@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import threading
 import time
@@ -50,16 +51,37 @@ class AdmissionEvictionPrefetchTest(unittest.TestCase):
         store = _FakePrefetchStore(gate)
         prefetcher = Prefetcher(store, max_workers=1, max_queue=1)
         try:
-            self.assertTrue(prefetcher.submit(key1).submitted)
-            self.assertFalse(prefetcher.submit(key1).submitted)
-            self.assertFalse(prefetcher.submit(key2).submitted)
+            self.assertTrue(prefetcher.submit(key1, TierName.MEMORY).submitted)
+            self.assertFalse(prefetcher.submit(key1, TierName.MEMORY).submitted)
+            self.assertFalse(prefetcher.submit(key2, TierName.MEMORY).submitted)
             gate.set()
             for _ in range(50):
                 if prefetcher.stats()["pending"] == 0:
                     break
                 time.sleep(0.01)
             self.assertEqual(prefetcher.stats()["pending"], 0)
-            self.assertTrue(prefetcher.submit(key2).submitted)
+            self.assertTrue(prefetcher.submit(key2, TierName.MEMORY).submitted)
+        finally:
+            gate.set()
+            prefetcher.shutdown()
+
+    def test_same_key_can_prefetch_to_distinct_targets(self) -> None:
+        key = _key("target")
+        gate = threading.Event()
+        store = _FakePrefetchStore(gate)
+        prefetcher = Prefetcher(store, max_workers=2, max_queue=2)
+        try:
+            self.assertTrue(prefetcher.submit(key, TierName.MEMORY).submitted)
+            self.assertTrue(prefetcher.submit(key, TierName.NVME).submitted)
+            gate.set()
+            for _ in range(50):
+                if prefetcher.stats()["pending"] == 0:
+                    break
+                time.sleep(0.01)
+            self.assertCountEqual(
+                store.calls,
+                [(key, TierName.MEMORY), (key, TierName.NVME)],
+            )
         finally:
             gate.set()
             prefetcher.shutdown()
@@ -68,17 +90,17 @@ class AdmissionEvictionPrefetchTest(unittest.TestCase):
 class _FakePrefetchStore:
     def __init__(self, gate: threading.Event):
         self.gate = gate
-        self.calls = 0
+        self.calls: list[tuple[BlockKey, TierName]] = []
 
     def prefetch(self, keys: list[BlockKey], target_tier: TierName) -> None:
-        self.calls += 1
+        self.calls.append((keys[0], target_tier))
         self.gate.wait(timeout=1.0)
-        if keys[0].block_hash.startswith("f"):
+        if keys[0] == _key("f"):
             raise RuntimeError("boom")
 
 
 def _key(seed: str) -> BlockKey:
-    return BlockKey("t", "m", "r", "tok", seed * 64)
+    return BlockKey("t", "m", "r", "tok", hashlib.sha256(seed.encode()).hexdigest())
 
 
 if __name__ == "__main__":

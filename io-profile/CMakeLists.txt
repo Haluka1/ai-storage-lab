@@ -10,3 +10,8 @@ target_include_directories(file_generator PRIVATE include)
 
 add_executable(io_path_bench src/io_path_bench.cpp)
 target_include_directories(io_path_bench PRIVATE include)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(file_generator PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(io_path_bench PRIVATE -Wall -Wextra -Wpedantic)
+endif()

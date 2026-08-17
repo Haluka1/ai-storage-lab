@@ -53,4 +53,4 @@ Selection and lifecycle accounting are separate steps. [`reserveRoutableWorker`]
 
 ## Logging and metrics
 
-Decision/trace files are disabled by default. When explicitly enabled, records contain bounded hashes and enumerated labels rather than raw request text, tenant IDs, or full block hashes. The proxy response exposes selected Worker, strategy, and a redacted request hash for reviewability.
+Decision/trace files are disabled by default. Request-derived and tenant-derived identifiers are hashed, and records do not contain raw request text or full block hashes. Opt-in decision logs still contain Worker IDs, topology, and candidate control-plane metadata for debugging. The proxy response exposes selected Worker, strategy, and a redacted request hash for reviewability.

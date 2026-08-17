@@ -7,15 +7,16 @@ import (
 	"sort"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 type Snapshot struct {
-	SchemaVersion int                    `json:"schema_version"`
-	CreatedAt     time.Time              `json:"created_at"`
-	TTLMS         int64                  `json:"ttl_ms"`
-	NextSeqNo     int64                  `json:"next_seq_no"`
-	Locations     []common.BlockLocation `json:"locations"`
+	SchemaVersion   int                       `json:"schema_version"`
+	CreatedAt       time.Time                 `json:"created_at"`
+	TTLMS           int64                     `json:"ttl_ms"`
+	NextSeqNo       int64                     `json:"next_seq_no"`
+	LastSeqByWorker map[common.WorkerID]int64 `json:"last_seq_by_worker"`
+	Locations       []common.BlockLocation    `json:"locations"`
 }
 
 func (idx *Index) Snapshot() Snapshot {
@@ -36,12 +37,17 @@ func (idx *Index) Snapshot() Snapshot {
 		}
 		return locations[i].BlockHash < locations[j].BlockHash
 	})
+	lastSeqByWorker := make(map[common.WorkerID]int64, len(idx.lastSeqByWorker))
+	for worker, seqNo := range idx.lastSeqByWorker {
+		lastSeqByWorker[worker] = seqNo
+	}
 	return Snapshot{
-		SchemaVersion: 1,
-		CreatedAt:     now.UTC(),
-		TTLMS:         idx.ttl.Milliseconds(),
-		NextSeqNo:     idx.nextSeqNo,
-		Locations:     locations,
+		SchemaVersion:   2,
+		CreatedAt:       now.UTC(),
+		TTLMS:           idx.ttl.Milliseconds(),
+		NextSeqNo:       idx.nextSeqNo,
+		LastSeqByWorker: lastSeqByWorker,
+		Locations:       locations,
 	}
 }
 
@@ -80,13 +86,22 @@ func (idx *Index) RestoreSnapshot(snapshot Snapshot) {
 	idx.byBlock = make(map[common.BlockHash]map[common.WorkerID]common.BlockLocation)
 	idx.appliedEventIDs = make(map[string]struct{})
 	idx.lastSeqByWorker = make(map[common.WorkerID]int64)
+	for worker, seqNo := range snapshot.LastSeqByWorker {
+		if seqNo > 0 {
+			idx.lastSeqByWorker[worker] = seqNo
+		}
+	}
 	idx.nextSeqNo = snapshot.NextSeqNo
 	for _, loc := range snapshot.Locations {
 		normalizeLocation(&loc, idx.now(), idx.ttl)
 		if loc.SeqNo > idx.nextSeqNo {
 			idx.nextSeqNo = loc.SeqNo
 		}
-		idx.markWorkerSeqLocked(loc.WorkerID, loc.SeqNo)
+		// Schema v1 did not distinguish local revisions from producer
+		// sequences. Preserve its conservative behavior only for legacy files.
+		if snapshot.SchemaVersion < 2 {
+			idx.markWorkerSeqLocked(loc.WorkerID, loc.SeqNo)
+		}
 		locations := idx.byBlock[loc.BlockHash]
 		if locations == nil {
 			locations = make(map[common.WorkerID]common.BlockLocation)

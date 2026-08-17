@@ -3,7 +3,7 @@ SHELL := /bin/bash
 PYTHON ?= python3
 GO_CACHE ?= /tmp/ai-inference-showcase-gocache
 
-.PHONY: test test-router test-kv test-io test-demo demo demo-kv audit clean
+.PHONY: test test-router test-kv test-io test-demo demos demo demo-kv audit clean
 
 test: test-router test-kv test-io test-demo
 
@@ -25,6 +25,8 @@ test-io:
 
 test-demo:
 	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=examples/local-demo $(PYTHON) -m unittest discover -s examples/local-demo -p 'test_*.py' -v
+
+demos: demo demo-kv
 
 demo:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) examples/local-demo/run_demo.py

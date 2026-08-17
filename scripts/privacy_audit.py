@@ -60,6 +60,10 @@ def main() -> int:
     scanned = 0
     for path in candidates(root):
         relative = path.relative_to(root)
+        relative_text = relative.as_posix()
+        for label, rule in TEXT_RULES:
+            if rule.search(relative_text):
+                findings.append(f"{relative}: {label} in file path")
         if path.suffix.lower() in FORBIDDEN_EXTENSIONS:
             findings.append(f"{relative}: forbidden private/binary artifact extension")
             continue

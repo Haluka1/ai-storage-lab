@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 import tempfile
@@ -9,13 +10,19 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from kvstore.errors import BlockNotFound, ChecksumMismatch, MetadataMismatch
+from kvstore.errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch
 from kvstore.metadata import BlockKey, KVMetadata
 from kvstore.metadata_store import MetadataStore
 from kvstore.nvme_tier import HEADER_LEN_STRUCT, MAGIC, NVMeTier
 
 
 class NVMeTierTest(unittest.TestCase):
+    def test_direct_io_option_fails_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            with self.assertRaisesRegex(NotImplementedError, "does not implement O_DIRECT"):
+                NVMeTier(Path(td) / "nvme", 1024, store, use_direct_io=True)
+
     def test_store_load_atomic_and_evict(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
@@ -69,6 +76,21 @@ class NVMeTierTest(unittest.TestCase):
             with self.assertRaises(ChecksumMismatch):
                 tier.load(key)
             self.assertIsNone(tier.lookup(key))
+
+    def test_corruption_cleanup_failure_preserves_corruption_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key = _key("cleanup")
+            tier.store(key, b"payload", _metadata(key, 7))
+            path = tier.layout.block_path(key)
+            header, _payload = _read_raw(path)
+            _write_raw(path, header, b"corrupt")
+            with mock.patch.object(tier, "evict", side_effect=OSError("read-only")):
+                with self.assertRaises(CorruptionCleanupFailed) as ctx:
+                    tier.load(key)
+            self.assertEqual(ctx.exception.operation, "evict")
+            self.assertIsInstance(ctx.exception.__cause__, ChecksumMismatch)
 
     def test_segment_layout_appends_blocks_to_shared_segment(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -358,7 +380,7 @@ class NVMeTierTest(unittest.TestCase):
 
 
 def _key(seed: str) -> BlockKey:
-    return BlockKey("t", "m", "r", "tok", seed * 64)
+    return BlockKey("t", "m", "r", "tok", hashlib.sha256(seed.encode()).hexdigest())
 
 
 def _key_hash(block_hash: str) -> BlockKey:

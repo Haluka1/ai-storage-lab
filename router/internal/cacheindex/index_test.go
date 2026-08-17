@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 func TestOverlapByWorker(t *testing.T) {
@@ -63,7 +63,7 @@ func TestSnapshotRoundTripPreservesOverlap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.SchemaVersion != 1 {
+	if snapshot.SchemaVersion != 2 {
 		t.Fatalf("snapshot schema version=%d", snapshot.SchemaVersion)
 	}
 	got := restored.OverlapByWorker([]common.BlockHash{"a", "b"})
@@ -73,6 +73,37 @@ func TestSnapshotRoundTripPreservesOverlap(t *testing.T) {
 	locations := restored.LocationsByWorker([]common.BlockHash{"b"})
 	if locations["worker-1"][0].Transport != common.TransportS3HTTPDefault {
 		t.Fatalf("transport was not preserved: %#v", locations["worker-1"][0])
+	}
+}
+
+func TestZeroSequenceDoesNotAdvanceProducerWatermark(t *testing.T) {
+	idx := New(time.Minute)
+	if err := idx.ApplyEvent(Event{EventType: "block_stored", BlockHash: "local", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 16, SeqNo: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.ApplyEvent(Event{EventType: "block_stored", BlockHash: "ordered", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 32, SeqNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.OverlapByWorker([]common.BlockHash{"ordered"}); got["worker-0"] != 1 {
+		t.Fatalf("producer sequence 1 was rejected after unordered local store: %v", got)
+	}
+	if got := idx.Snapshot().LastSeqByWorker["worker-0"]; got != 1 {
+		t.Fatalf("producer watermark=%d, want 1", got)
+	}
+}
+
+func TestSnapshotKeepsLocalRevisionOutOfProducerWatermark(t *testing.T) {
+	idx := New(time.Minute)
+	if err := idx.ApplyEvent(Event{EventType: "block_stored", BlockHash: "local", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 16}); err != nil {
+		t.Fatal(err)
+	}
+	restored := New(time.Minute)
+	restored.RestoreSnapshot(idx.Snapshot())
+	if err := restored.ApplyEvent(Event{EventType: "block_stored", BlockHash: "ordered", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 16, SeqNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := restored.OverlapByWorker([]common.BlockHash{"ordered"}); got["worker-0"] != 1 {
+		t.Fatalf("restored local revision polluted producer watermark: %v", got)
 	}
 }
 

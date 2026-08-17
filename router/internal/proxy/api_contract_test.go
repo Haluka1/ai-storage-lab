@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"ai-inference-storage-showcase/router/internal/common"
+	"github.com/Haluka1/ai-storage-lab/router/internal/common"
 )
 
 const contractTraceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"

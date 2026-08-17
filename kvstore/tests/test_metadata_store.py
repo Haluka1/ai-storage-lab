@@ -14,6 +14,22 @@ from kvstore.metadata_store import MetadataStore
 
 
 class MetadataStoreTest(unittest.TestCase):
+    def test_adversarial_namespaces_do_not_overwrite_each_other(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            block_hash = "a" * 64
+            key_a = BlockKey("a/model=b", "c", "r", "tok", block_hash)
+            key_b = BlockKey("a", "b/model=c", "r", "tok", block_hash)
+            for key, uri in [(key_a, "memory://a"), (key_b, "memory://b")]:
+                store.upsert(
+                    BlockLocation(
+                        key, TierName.MEMORY, uri, 4, "abcd", time.time(), time.time()
+                    ),
+                    KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum="abcd"),
+                )
+            self.assertEqual(store.lookup(key_a, TierName.MEMORY)[0].uri, "memory://a")
+            self.assertEqual(store.lookup(key_b, TierName.MEMORY)[0].uri, "memory://b")
+
     def test_lookup_and_inflight_delete_guard(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
