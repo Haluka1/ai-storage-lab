@@ -3,7 +3,9 @@ package cacheindex
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -89,6 +91,11 @@ func ReadEvents(path string) ([]Event, error) {
 }
 
 func (idx *Index) ApplyEvent(event Event) error {
+	validated, err := validateEvent(event)
+	if err != nil {
+		return err
+	}
+	event = validated
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	if !idx.acceptEventLocked(event) {
@@ -138,6 +145,62 @@ func (idx *Index) ApplyEvent(event Event) error {
 	default:
 		return fmt.Errorf("unknown cache event type %q", event.EventType)
 	}
+}
+
+func validateEvent(event Event) (Event, error) {
+	if event.SeqNo < 0 || event.SeqNo == math.MaxInt64 {
+		return Event{}, errors.New("cache event seq_no must be non-negative and below MaxInt64")
+	}
+	switch event.EventType {
+	case "block_stored":
+		if event.Tokens < 0 {
+			return Event{}, errors.New("cache event tokens must be non-negative")
+		}
+		if event.Location != nil {
+			loc := *event.Location
+			if loc.SeqNo < 0 || loc.SeqNo == math.MaxInt64 {
+				return Event{}, errors.New("cache location seq_no must be non-negative and below MaxInt64")
+			}
+			if event.BlockHash != "" && loc.BlockHash != "" && event.BlockHash != loc.BlockHash {
+				return Event{}, errors.New("cache event and location block_hash differ")
+			}
+			if event.WorkerID != "" && loc.WorkerID != "" && event.WorkerID != loc.WorkerID {
+				return Event{}, errors.New("cache event and location worker_id differ")
+			}
+			if event.SeqNo > 0 && loc.SeqNo > 0 && event.SeqNo != loc.SeqNo {
+				return Event{}, errors.New("cache event and location seq_no differ")
+			}
+			if event.BlockHash == "" {
+				event.BlockHash = loc.BlockHash
+			}
+			if event.WorkerID == "" {
+				event.WorkerID = loc.WorkerID
+			}
+			if event.SeqNo == 0 {
+				event.SeqNo = loc.SeqNo
+			}
+			if loc.BlockHash == "" {
+				loc.BlockHash = event.BlockHash
+			}
+			if loc.WorkerID == "" {
+				loc.WorkerID = event.WorkerID
+			}
+			if loc.SeqNo == 0 {
+				loc.SeqNo = event.SeqNo
+			}
+			event.Location = &loc
+		}
+	case "block_evicted":
+		if event.Location != nil {
+			return Event{}, errors.New("cache eviction event must not contain a location")
+		}
+	default:
+		return Event{}, fmt.Errorf("unknown cache event type %q", event.EventType)
+	}
+	if event.BlockHash == "" || event.WorkerID == "" {
+		return Event{}, errors.New("cache event block_hash and worker_id are required")
+	}
+	return event, nil
 }
 
 func (idx *Index) acceptEventLocked(event Event) bool {

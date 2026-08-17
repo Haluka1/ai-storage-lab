@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from kvstore.errors import MetadataMismatch
+from kvstore.errors import ImmutableBlockConflict, MetadataMismatch
 from kvstore.metadata import BlockKey, BlockLocation, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
 
@@ -313,7 +313,7 @@ os._exit(0)
             )
 
             with self.assertRaisesRegex(
-                MetadataMismatch, "descriptor cannot change"
+                ImmutableBlockConflict, "descriptor cannot change across tiers"
             ):
                 store.upsert(
                     location,
@@ -321,6 +321,48 @@ os._exit(0)
                         key, "fp16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A
                     ),
                 )
+
+    def test_active_payload_descriptor_cannot_conflict_across_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            key = BlockKey("t", "m", "r", "tok", "6" * 64)
+            memory_metadata = KVMetadata(
+                key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A
+            )
+            store.upsert(
+                BlockLocation(
+                    key,
+                    TierName.MEMORY,
+                    f"memory://block/{key.block_hash}",
+                    4,
+                    CHECKSUM_A,
+                    time.time(),
+                    time.time(),
+                ),
+                memory_metadata,
+            )
+
+            with self.assertRaisesRegex(
+                ImmutableBlockConflict, "descriptor cannot change across tiers"
+            ):
+                store.upsert(
+                    BlockLocation(
+                        key,
+                        TierName.S3,
+                        "s3://bucket/conflict",
+                        4,
+                        CHECKSUM_B,
+                        time.time(),
+                        time.time(),
+                    ),
+                    KVMetadata(
+                        key, "fp16", 1, 1, 1, 1, 4, checksum=CHECKSUM_B
+                    ),
+                )
+
+            self.assertEqual(len(store.lookup(key)), 1)
+            self.assertEqual(store.lookup(key)[0].tier, TierName.MEMORY)
+            store.close()
 
 
 if __name__ == "__main__":

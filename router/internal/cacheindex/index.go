@@ -1,6 +1,7 @@
 package cacheindex
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -58,7 +59,9 @@ func (idx *Index) StoreLocation(loc common.BlockLocation) {
 }
 
 func (idx *Index) storeLocationLocked(loc common.BlockLocation, rejectStale bool, producerOrdered bool) bool {
-	idx.nextSeqNo++
+	if idx.nextSeqNo < math.MaxInt64 {
+		idx.nextSeqNo++
+	}
 	now := idx.now()
 	if loc.SeqNo == 0 {
 		loc.SeqNo = idx.nextSeqNo

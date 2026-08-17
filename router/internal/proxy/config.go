@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -109,6 +110,9 @@ func (cfg Config) Validate() error {
 		if worker.URL == "" {
 			return errors.New("worker url must not be empty")
 		}
+		if err := validateWorkerURL(worker.URL); err != nil {
+			return fmt.Errorf("worker %q has invalid url: %w", worker.ID, err)
+		}
 		if _, duplicate := workerIDs[worker.ID]; duplicate {
 			return fmt.Errorf("duplicate worker id %q", worker.ID)
 		}
@@ -119,6 +123,26 @@ func (cfg Config) Validate() error {
 		if worker.QueueDepth < 0 || worker.ActiveDecodeBlocks < 0 || worker.InflightRequests < 0 {
 			return fmt.Errorf("worker %q queue, decode, and inflight counts must be non-negative", worker.ID)
 		}
+	}
+	return nil
+}
+
+func validateWorkerURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return errors.New("worker url scheme must be http or https")
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return errors.New("worker url must be absolute")
+	}
+	if parsed.User != nil {
+		return errors.New("worker url must not contain userinfo")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("worker url must not contain a query or fragment")
 	}
 	return nil
 }

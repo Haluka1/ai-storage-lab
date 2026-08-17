@@ -13,7 +13,7 @@ completion/chat-compatible client
 
 Inside the Router, [`handleProxy`](../router/internal/proxy/handler.go) parses only the request fields required to derive text/model/output limits. It computes deterministic approximate tokens and chained block hashes, reads CacheIndex metadata, asks a strategy to pick a candidate, then reacquires the Worker lock. Only a still-routable Worker receives a Router-owned inflight lifecycle count. The count is released after the upstream response body has finished copying, including streaming responses; it does not reserve Worker compute, memory, or KV capacity. The Router makes no second-Worker retry if the upstream attempt or response stream fails.
 
-The public listener exposes health, readiness, redacted metrics, and the two inference paths. Those paths implement a tested OpenAI-compatible proxy subset, not the complete OpenAI API. Worker replacement, drain/undrain, and cache events live on a separate admin listener that configuration validation restricts to loopback.
+The public listener exposes health, readiness, redacted metrics, and the two inference paths. Those paths implement a tested OpenAI-compatible proxy subset, not the complete OpenAI API. Worker replacement, drain/undrain, and cache events live on a separate admin listener that configuration validation restricts to loopback. Configured Worker endpoints must be absolute HTTP(S) URLs, and the Router never follows an upstream redirect to a Worker-selected destination.
 
 The admin replacement contract does not treat a stable Worker ID as a process generation. URL or topology identity cannot mutate in place: the old registration must first drain and be removed. Successful removal purges its CacheIndex observations and producer watermark. A control plane that later reuses the ID must have quiesced the retired event producer; automatic discovery and generation fencing are not implemented.
 
@@ -55,18 +55,18 @@ The checked-in fixture is synthetic contract input. It is not a hardware result 
 ## Current boundary
 
 - The Router uses deterministic approximate tokenization in its live request path; the approximation is not engine-accurate tokenization or KV identity.
-- Cache-event idempotence applies to non-empty event IDs, and ordered delivery checks apply to positive per-Worker producer sequence numbers. Sequence zero is an internal unordered mode that does not advance the producer watermark; the admin event API requires a positive sequence. Expired locations and remembered event IDs are not continuously garbage-collected in-process.
+- Cache-event idempotence applies to non-empty event IDs, and ordered delivery checks apply to positive per-Worker producer sequence numbers. Events rejected by package validation fail before deduplication or watermark state changes; a valid stale event still consumes its immutable event ID. Sequence zero is an internal unordered mode that does not advance the producer watermark; the admin event API requires a positive sequence. Expired locations and remembered event IDs are not continuously garbage-collected in-process.
 - Cache events and Worker metrics are supplied by config/admin calls. There is no production telemetry pipeline or automatic Worker discovery.
 - Drain and locked revalidation prevent new unsafe reservations; they do not implement transparent retry or automatic failover.
 - `MemoryTier` uses host memory. `NVMeTier` is a retained API name for a file-backed abstraction.
 - `BlockKey` validates bounded namespace fields and a lowercase SHA-256 block hash. SQLite uses a versioned canonical JSON identity, while file and S3-compatible layouts share safe encoded components.
-- An active `BlockKey` is immutable: replaying identical bytes and the same payload descriptor is idempotent, while conflicting bytes or dtype/shape/token metadata are rejected. Reuse after explicit tombstone-backed deletion is a new publication.
-- File/segment URIs loaded from SQLite are revalidated against the configured root and canonical layout. S3 locations must match the configured bucket, prefix, and canonical key before read or deletion.
+- Within one metadata database, an active `BlockKey` is immutable across tiers: replaying identical bytes and the same payload descriptor is idempotent, while conflicting bytes or dtype/shape/token metadata are rejected. Reuse after explicit tombstone-backed deletion is a new publication.
+- File/segment URIs loaded from SQLite are revalidated against the configured root and canonical layout. S3 location paths are canonical percent-encodings of literal object keys and must match the configured bucket, prefix, and key before read or deletion.
 - The file-backed tier does not implement direct I/O; `use_direct_io=True` fails explicitly instead of becoming a silent configuration no-op.
 - Encoded components and a resolved descendant check reject input-driven traversal and existing symlink escape. The configured root is still a trusted local directory, not a hostile multi-user filesystem sandbox with `openat`/no-follow guarantees.
 - The file tier defaults to `fsync_on_store=False`; it does not promise strong commit durability after abrupt power loss.
 - SQLite owner epoch and `flock` enforce one live process per metadata database, not a distributed lease.
-- The S3-compatible boundary is covered with local fakes/fault injection. Default tests do not contact an object service.
+- The S3-compatible boundary is covered with local fakes/fault injection. GET response bodies are closed on success and failure, and body-read failures remain availability errors rather than corruption. Default tests do not contact an object service.
 - Structural record damage, identity/length mismatch, and checksum mismatch remain explicit corruption errors after invalidating the location. If invalidation itself fails, `CorruptionCleanupFailed` preserves the corruption classification and cleanup cause; only tested S3 lookup/load unavailability becomes a miss-like recompute result when no healthy tier can serve the block.
 - Segment compaction is a caller-invoked synchronous maintenance operation under local locks, not an online background service.
 - Topology and transport values are metadata consumed by a cost function. They do not implement a specialized transfer data plane.

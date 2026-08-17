@@ -320,6 +320,48 @@ func TestProxyRemovesDynamicHopByHopHeaders(t *testing.T) {
 	}
 }
 
+func TestProxyDoesNotFollowWorkerRedirect(t *testing.T) {
+	redirected := make(chan struct{}, 1)
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer redirectTarget.Close()
+
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL+"/capture", http.StatusTemporaryRedirect)
+	}))
+	defer worker.Close()
+
+	cfg := testConfig(t.TempDir(), "round_robin")
+	cfg.Workers = cfg.Workers[:1]
+	cfg.Workers[0].URL = worker.URL
+	handler, err := NewHandler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Close()
+	// The Router owns redirect policy even when a caller injects a client that
+	// explicitly requests the default follow behavior.
+	handler.SetHTTPClient(&http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return nil }})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"m","prompt":"must stay at selected worker","max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("redirect status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); location != "" {
+		t.Fatalf("rejected upstream redirect leaked Location %q", location)
+	}
+	select {
+	case <-redirected:
+		t.Fatal("Router followed a Worker redirect to an unconfigured origin")
+	default:
+	}
+}
+
 func TestCachePredictionMetricsComparePredictedAndWorkerActuals(t *testing.T) {
 	td := t.TempDir()
 	cfg := testConfig(td, "prefix_hash")
@@ -426,6 +468,36 @@ func TestConfigAndAdminRejectDuplicateWorkerIDs(t *testing.T) {
 	handler.AdminHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "duplicate worker id") {
 		t.Fatalf("duplicate admin worker status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestConfigAndAdminRejectUnsafeWorkerURLs(t *testing.T) {
+	for _, workerURL := range []string{
+		"ftp://worker.example.invalid",
+		"http://placeholder@127.0.0.1",
+		"http://worker.example.invalid/#fragment",
+	} {
+		cfg := testConfig(t.TempDir(), "cost_aware")
+		cfg.Workers[0].URL = workerURL
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected unsafe Worker URL %q to be rejected", workerURL)
+		}
+	}
+
+	handler := newTestHandler(t, filepath.Join(t.TempDir(), "decisions.jsonl"), "cost_aware")
+	defer handler.Close()
+	workers := handler.snapshotWorkers()
+	workers = append(workers, common.WorkerState{
+		ID:          "worker-unsafe",
+		URL:         "ftp://worker.example.invalid",
+		Health:      common.WorkerReady,
+		LastUpdated: time.Now().UTC(),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/workers", strings.NewReader(mustJSON(t, workers)))
+	rec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe admin Worker URL status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

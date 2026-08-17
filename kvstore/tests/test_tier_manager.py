@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from kvstore.cost_model import CostModel, Decision, TierProfile
-from kvstore.errors import BlockNotFound, TierUnavailable
+from kvstore.errors import BlockNotFound, ImmutableBlockConflict, TierUnavailable
 from kvstore.memory_tier import MemoryTier
 from kvstore.metadata import BlockKey, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
@@ -120,6 +120,95 @@ class TierManagerTest(unittest.TestCase):
             self.assertEqual(result.data, b"payload")
             self.assertTrue(store.tiers[TierName.MEMORY].contains(key))
 
+    def test_active_block_key_descriptor_is_immutable_across_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = _store(Path(td))
+            key = _key("cross-tier-identity")
+            try:
+                store.store(
+                    key,
+                    b"payload-a",
+                    _metadata(key, 4096, 9),
+                    preferred_tier=TierName.NVME,
+                )
+
+                with self.assertRaises(ImmutableBlockConflict):
+                    store.store(
+                        key,
+                        b"payload-b",
+                        _metadata(key, 4096, 9),
+                        preferred_tier=TierName.MEMORY,
+                    )
+                self.assertFalse(store.tiers[TierName.MEMORY].contains(key))
+                self.assertEqual(store.tiers[TierName.NVME].load(key).data, b"payload-a")
+
+                changed_metadata = _metadata(key, 4096, 9)
+                changed_metadata.dtype = "fp16"
+                with self.assertRaises(ImmutableBlockConflict):
+                    store.store(
+                        key,
+                        b"payload-a",
+                        changed_metadata,
+                        preferred_tier=TierName.MEMORY,
+                    )
+
+                store.store(
+                    key,
+                    b"payload-a",
+                    _metadata(key, 4096, 9),
+                    preferred_tier=TierName.MEMORY,
+                )
+                self.assertEqual(store.tiers[TierName.MEMORY].load(key).data, b"payload-a")
+            finally:
+                store.close()
+
+    def test_conflicting_concurrent_cross_tier_stores_publish_one_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = _store(Path(td))
+            key = _key("concurrent-cross-tier-identity")
+            start = threading.Barrier(3)
+            outcomes: list[tuple[str, TierName, bytes]] = []
+            outcomes_lock = threading.Lock()
+
+            def write(tier: TierName, data: bytes) -> None:
+                start.wait()
+                try:
+                    store.store(
+                        key,
+                        data,
+                        _metadata(key, 4096, len(data)),
+                        preferred_tier=tier,
+                    )
+                    outcome = "stored"
+                except ImmutableBlockConflict:
+                    outcome = "conflict"
+                with outcomes_lock:
+                    outcomes.append((outcome, tier, data))
+
+            threads = [
+                threading.Thread(target=write, args=(TierName.MEMORY, b"memory-value")),
+                threading.Thread(target=write, args=(TierName.NVME, b"file-value")),
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                start.wait()
+                for thread in threads:
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive(), "concurrent store did not finish")
+
+                self.assertEqual(
+                    sorted(outcome for outcome, _tier, _data in outcomes),
+                    ["conflict", "stored"],
+                )
+                locations = store.locations(key)
+                self.assertEqual(len(locations), 1)
+                winner = next(item for item in outcomes if item[0] == "stored")
+                self.assertEqual(locations[0].tier, winner[1])
+                self.assertEqual(store.tiers[winner[1]].load(key).data, winner[2])
+            finally:
+                store.close()
+
     def test_cost_model_can_skip_short_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = _store(Path(td))
@@ -177,6 +266,50 @@ class TierManagerTest(unittest.TestCase):
             self.assertFalse(memory.contains(key))
             self.assertEqual(sum(metrics.kv_onload_timeout_total.values.values()), 1.0)
             self.assertEqual(sum(metrics.kv_onload_fallback_total.values.values()), 1.0)
+
+    def test_s3_body_read_timeout_falls_back_to_recompute_and_closes_body(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            client = _FakeS3Client()
+            memory = MemoryTier(1024 * 1024, meta)
+            s3 = S3Tier("bucket", "blocks", meta, client=client)
+            store = MultiTierKVBlockStore(
+                [memory, s3],
+                meta,
+                CostModel(
+                    {
+                        TierName.MEMORY: TierProfile(0.01, 80.0),
+                        TierName.S3: TierProfile(1.0, 10.0),
+                    },
+                    load_benefit_threshold_ms=0.0,
+                    s3_load_benefit_threshold_ms=0.0,
+                    s3_min_missing_prefill_tokens=1,
+                    s3_min_reuse_probability=0.0,
+                ),
+            )
+            key = _key("body-read-timeout")
+            store.store(
+                key,
+                b"payload",
+                _metadata(key, 4096, 7),
+                preferred_tier=TierName.S3,
+            )
+            body = _ReadFailureBody()
+            client.body_override = body
+            try:
+                with self.assertRaisesRegex(
+                    BlockNotFound, "s3_load_unavailable_recompute"
+                ):
+                    store.load(
+                        key,
+                        target_tier=TierName.MEMORY,
+                        slo_budget_ms=1000.0,
+                    )
+                self.assertTrue(body.closed)
+                self.assertFalse(memory.contains(key))
+            finally:
+                store.close()
 
     def test_s3_head_timeout_falls_back_to_recompute(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -296,6 +429,7 @@ class _FakeS3Client:
     def __init__(self):
         self.objects: dict[tuple[str, str], bytes] = {}
         self.metadata: dict[tuple[str, str], dict[str, str]] = {}
+        self.body_override = None
 
     def put_object(self, Bucket: str, Key: str, Body: bytes, Metadata: dict[str, str]):
         self.objects[(Bucket, Key)] = bytes(Body)
@@ -306,7 +440,10 @@ class _FakeS3Client:
         key = (Bucket, Key)
         if key not in self.objects:
             raise _FakeNotFound()
-        return {"Body": io.BytesIO(self.objects[key]), "Metadata": self.metadata.get(key, {})}
+        body = self.body_override
+        if body is None:
+            body = io.BytesIO(self.objects[key])
+        return {"Body": body, "Metadata": self.metadata.get(key, {})}
 
     def head_object(self, Bucket: str, Key: str):
         key = (Bucket, Key)
@@ -325,6 +462,17 @@ class _FakeS3Client:
 
 class _FakeNotFound(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class _ReadFailureBody:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def read(self) -> bytes:
+        raise TimeoutError("injected streaming body timeout")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 if __name__ == "__main__":

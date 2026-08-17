@@ -63,6 +63,7 @@ class MemoryTier:
             metadata.bytes = len(data)
             metadata.last_access = time.time()
             metadata.validate(require_checksum=True)
+            self.metadata_store.validate_payload_descriptor(metadata)
             existing_location = self.lookup(key)
             if existing_location is not None:
                 if self._data[key] != data:

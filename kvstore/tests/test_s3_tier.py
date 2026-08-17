@@ -182,6 +182,122 @@ class S3TierTest(unittest.TestCase):
             self.assertEqual(object_key.split("/")[1:], storage_key_parts(key))
             self.assertNotIn("tenant/a", object_key)
 
+    def test_uri_significant_prefix_round_trips_canonically(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "cache ?#%/雪", meta, client=client)
+            key = _key("uri-prefix")
+            tier.store(key, b"payload", _metadata(key, 7))
+
+            literal_key = tier.object_key(key)
+            self.assertIn(("bucket", literal_key), client.objects)
+            location = meta.lookup(key, TierName.S3)[0]
+            self.assertNotIn("?", location.uri)
+            self.assertNotIn("#", location.uri)
+            self.assertIn("%", location.uri)
+            self.assertEqual(tier.load(key).data, b"payload")
+
+    def test_invalid_bucket_authority_is_rejected_before_client_use(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            for bucket in ("bad/bucket", "bad@bucket", "bad bucket", "bad:bucket"):
+                with self.subTest(bucket=bucket), self.assertRaises(ValueError):
+                    S3Tier(bucket, "blocks", meta, client=client)
+            self.assertEqual(client.objects, {})
+
+    def test_streaming_body_read_failure_is_unavailable_and_body_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("body-read-failure")
+            tier.store(key, b"payload", _metadata(key, 7))
+            body = ReadFailureBody()
+            client.body_override = body
+
+            with self.assertRaises(TierUnavailable) as raised:
+                tier.load(key)
+
+            self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+            self.assertTrue(body.closed)
+            self.assertEqual(len(meta.lookup(key, TierName.S3)), 1)
+
+    def test_streaming_body_close_failure_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("body-close-failure")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            body = CloseFailureBody(client.objects[("bucket", object_key)])
+            client.body_override = body
+
+            with self.assertRaises(TierUnavailable) as raised:
+                tier.load(key)
+
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertEqual(body.close_calls, 1)
+
+    def test_successful_streaming_body_is_closed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("body-success")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            body = TrackingBody(client.objects[("bucket", object_key)])
+            client.body_override = body
+
+            self.assertEqual(tier.load(key).data, b"payload")
+            self.assertEqual(body.close_calls, 1)
+
+    def test_body_read_error_remains_primary_when_close_also_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("body-read-and-close-failure")
+            tier.store(key, b"payload", _metadata(key, 7))
+            body = ReadAndCloseFailureBody()
+            client.body_override = body
+
+            with self.assertRaises(TierUnavailable) as raised:
+                tier.load(key)
+
+            self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+            self.assertIsInstance(raised.exception.close_error, OSError)
+            self.assertEqual(body.close_calls, 1)
+
+    def test_noncanonical_percent_escape_in_persisted_uri_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "cache?", meta, client=client)
+            key = _key("noncanonical-uri")
+            tier.store(key, b"payload", _metadata(key, 7))
+            location = meta.lookup(key, TierName.S3)[0]
+            self.assertIn("%3F", location.uri)
+            location.uri = location.uri.replace("%3F", "%3f", 1)
+            metadata = meta.get_metadata(key, TierName.S3)
+            self.assertIsNotNone(metadata)
+            meta.upsert(location, metadata)
+
+            with self.assertRaises(MetadataMismatch):
+                tier.lookup(key)
+
+    def test_prefix_length_and_controls_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            for prefix in ("x" * 1025, "line\nbreak", "nul\x00byte"):
+                with self.subTest(prefix_length=len(prefix)), self.assertRaises(ValueError):
+                    S3Tier("bucket", prefix, meta, client=client)
+            self.assertEqual(client.objects, {})
+
     def test_fault_injection_times_out_selected_operation(self) -> None:
         client = FaultInjectingS3Client(
             FakeS3Client(),
@@ -278,6 +394,7 @@ class FakeS3Client:
         self.delete_failures_remaining = 0
         self.delete_noop = False
         self.head_calls = 0
+        self.body_override = None
 
     def put_object(self, Bucket: str, Key: str, Body: bytes, Metadata: dict[str, str]):
         self.objects[(Bucket, Key)] = bytes(Body)
@@ -289,7 +406,10 @@ class FakeS3Client:
         key = (Bucket, Key)
         if key not in self.objects:
             raise FakeNotFound()
-        return {"Body": io.BytesIO(self.objects[key]), "Metadata": self.metadata.get(key, {})}
+        body = self.body_override
+        if body is None:
+            body = io.BytesIO(self.objects[key])
+        return {"Body": body, "Metadata": self.metadata.get(key, {})}
 
     def head_object(self, Bucket: str, Key: str):
         self.head_calls += 1
@@ -314,6 +434,54 @@ class FakeS3Client:
 
 class FakeNotFound(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class ReadFailureBody:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def read(self) -> bytes:
+        raise TimeoutError("injected streaming body timeout")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class CloseFailureBody:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.close_calls = 0
+
+    def read(self) -> bytes:
+        return self._data
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise OSError("injected streaming body close failure")
+
+
+class TrackingBody:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.close_calls = 0
+
+    def read(self) -> bytes:
+        return self._data
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class ReadAndCloseFailureBody:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def read(self) -> bytes:
+        raise TimeoutError("injected streaming body timeout")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise OSError("injected streaming body close failure")
 
 
 def _key(seed: str) -> BlockKey:

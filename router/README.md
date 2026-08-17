@@ -39,7 +39,7 @@ Loopback-only admin listener:
 - `POST /admin/workers/{id}/undrain`
 - `POST /admin/events`
 
-Admin Worker/event input is a controlled metadata plane, not automatic discovery or telemetry. Configuration rejects a non-loopback admin address.
+Admin Worker/event input is a controlled metadata plane, not automatic discovery or telemetry. Configuration rejects a non-loopback admin address. Worker endpoints must be absolute HTTP(S) URLs without embedded credentials, query strings, or fragments. The proxy sends one upstream hop and rejects redirects instead of following a Worker-selected destination; this is a narrow endpoint boundary, not a general network sandbox.
 
 ## Identity boundary
 

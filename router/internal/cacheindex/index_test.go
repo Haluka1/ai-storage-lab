@@ -2,6 +2,7 @@ package cacheindex
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -205,6 +206,101 @@ func TestApplyEventDeduplicatesEventIDAndRejectsStaleWorkerSeq(t *testing.T) {
 	}
 	if got := idx.OverlapByWorker([]common.BlockHash{"a"}); got["worker-0"] != 0 {
 		t.Fatalf("fresh evict did not remove block: %v", got)
+	}
+}
+
+func TestInvalidEventDoesNotConsumeEventIDOrProducerSequence(t *testing.T) {
+	idx := New(time.Minute)
+	invalid := Event{
+		EventID:   "evt-corrected-retry",
+		EventType: "unknown",
+		BlockHash: "a",
+		WorkerID:  "worker-0",
+		Tier:      common.TierGPU,
+		Tokens:    16,
+		SeqNo:     1,
+	}
+	if err := idx.ApplyEvent(invalid); err == nil {
+		t.Fatal("expected unknown event type to fail")
+	}
+	invalid.EventType = "block_stored"
+	if err := idx.ApplyEvent(invalid); err != nil {
+		t.Fatalf("corrected retry failed: %v", err)
+	}
+	if got := idx.OverlapByWorker([]common.BlockHash{"a"}); got["worker-0"] != 1 {
+		t.Fatalf("invalid event consumed EventID or sequence: %v", got)
+	}
+
+	negative := Event{
+		EventID:   "evt-negative-retry",
+		EventType: "block_stored",
+		BlockHash: "b",
+		WorkerID:  "worker-0",
+		Tier:      common.TierGPU,
+		Tokens:    16,
+		SeqNo:     -1,
+	}
+	if err := idx.ApplyEvent(negative); err == nil {
+		t.Fatal("expected negative producer sequence to fail")
+	}
+	negative.SeqNo = 2
+	if err := idx.ApplyEvent(negative); err != nil {
+		t.Fatalf("corrected sequence retry failed: %v", err)
+	}
+	if got := idx.OverlapByWorker([]common.BlockHash{"b"}); got["worker-0"] != 1 {
+		t.Fatalf("invalid sequence consumed EventID or watermark: %v", got)
+	}
+
+	missingIdentity := Event{
+		EventID:   "evt-missing-identity",
+		EventType: "block_evicted",
+		WorkerID:  "worker-0",
+		SeqNo:     3,
+	}
+	if err := idx.ApplyEvent(missingIdentity); err == nil {
+		t.Fatal("expected missing block identity to fail")
+	}
+	if got := idx.Snapshot().LastSeqByWorker["worker-0"]; got != 2 {
+		t.Fatalf("invalid event advanced producer watermark to %d", got)
+	}
+}
+
+func TestValidStaleEventIDRemainsConsumed(t *testing.T) {
+	idx := New(time.Minute)
+	if err := idx.ApplyEvent(Event{EventID: "evt-new", EventType: "block_stored", BlockHash: "a", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 16, SeqNo: 10}); err != nil {
+		t.Fatal(err)
+	}
+	stale := Event{EventID: "evt-stale", EventType: "block_stored", BlockHash: "b", WorkerID: "worker-0", Tier: common.TierGPU, Tokens: 16, SeqNo: 9}
+	if err := idx.ApplyEvent(stale); err != nil {
+		t.Fatal(err)
+	}
+	stale.SeqNo = 11
+	if err := idx.ApplyEvent(stale); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.OverlapByWorker([]common.BlockHash{"b"}); got["worker-0"] != 0 {
+		t.Fatalf("immutable EventID was incorrectly reusable after a valid stale event: %v", got)
+	}
+}
+
+func TestMaximumProducerSequenceCannotOverflowLocalRevision(t *testing.T) {
+	idx := New(time.Minute)
+	err := idx.ApplyEvent(Event{
+		EventID:   "evt-max-sequence",
+		EventType: "block_stored",
+		BlockHash: "a",
+		WorkerID:  "worker-0",
+		Tier:      common.TierGPU,
+		Tokens:    16,
+		SeqNo:     math.MaxInt64,
+	})
+	if err == nil {
+		t.Fatal("expected maximum producer sequence to be rejected")
+	}
+	idx.Store("local", "worker-0", common.TierGPU, 16)
+	snapshot := idx.Snapshot()
+	if snapshot.NextSeqNo <= 0 {
+		t.Fatalf("local revision overflowed after rejected producer sequence: %d", snapshot.NextSeqNo)
 	}
 }
 

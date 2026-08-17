@@ -84,7 +84,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		entryTopology:  cfg.Router.EntryTopology,
 		workers:        append([]common.WorkerState(nil), cfg.Workers...),
 		routerInflight: make(map[common.WorkerID]int),
-		client:         &http.Client{Timeout: 0},
+		client:         oneHopHTTPClient(nil),
 		metrics:        NewMetrics(),
 		decisionLog:    logger,
 		traceLog:       traceLogger,
@@ -109,8 +109,19 @@ func (h *Handler) Close() error {
 
 func (h *Handler) SetHTTPClient(client *http.Client) {
 	if client != nil {
-		h.client = client
+		h.client = oneHopHTTPClient(client)
 	}
+}
+
+func oneHopHTTPClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: 0}
+	}
+	cloned := *client
+	cloned.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &cloned
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +222,10 @@ func (h *Handler) handleReplaceWorkers(w http.ResponseWriter, r *http.Request) {
 	for i := range workers {
 		if workers[i].ID == "" || workers[i].URL == "" {
 			writeText(w, http.StatusBadRequest, "worker id and url are required\n")
+			return
+		}
+		if err := validateWorkerURL(workers[i].URL); err != nil {
+			writeText(w, http.StatusBadRequest, "invalid worker url\n")
 			return
 		}
 		if _, duplicate := workerIDs[workers[i].ID]; duplicate {
@@ -447,6 +462,17 @@ func (h *Handler) proxyToWorker(w http.ResponseWriter, r *http.Request, body []b
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest && resp.Header.Get("Location") != "" {
+		h.traceLog.WriteSpan(h.runID, traceCtx, "proxy_to_worker", parentSpanID, started, "error", map[string]any{
+			"request_id_hash": reqCtx.RequestIDHash,
+			"strategy":        decision.Strategy,
+			"worker_id_hash":  hashPrefix(string(decision.WorkerID)),
+			"error_class":     "upstream_redirect_rejected",
+		})
+		h.metrics.ObserveRoute(decision.Strategy, "proxy_error", hashPrefix(string(decision.WorkerID)), 0)
+		writeText(w, http.StatusBadGateway, "upstream redirect rejected\n")
+		return errors.New("upstream redirect rejected")
+	}
 	if actualHit, actualMiss, ok := workerCacheActuals(resp.Header); ok {
 		h.metrics.ObserveCachePrediction(decision.OverlappedBlocks, actualHit, actualMiss)
 	}
@@ -772,12 +798,12 @@ func findWorker(workers []common.WorkerState, id common.WorkerID) (common.Worker
 }
 
 func joinWorkerURL(workerURL string, original *url.URL) (string, error) {
+	if err := validateWorkerURL(workerURL); err != nil {
+		return "", err
+	}
 	base, err := url.Parse(workerURL)
 	if err != nil {
 		return "", err
-	}
-	if base.Scheme == "" || base.Host == "" {
-		return "", fmt.Errorf("worker url must be absolute")
 	}
 	joined := *base
 	prefix := strings.TrimRight(base.Path, "/")

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from .checksum import sha256_hex, verify_sha256
 from .errors import (
@@ -32,6 +33,8 @@ from .record import (
 from .s3_fault_injection import FaultInjectingS3Client, S3FaultInjectionConfig
 
 MAX_S3_PAYLOAD_BYTES = 16 * 1024 * 1024 * 1024
+MAX_S3_PREFIX_BYTES = 1024
+_BUCKET_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,253}[A-Za-z0-9])?$")
 
 
 class S3Tier:
@@ -52,8 +55,18 @@ class S3Tier:
         fault_injection: dict[str, Any] | S3FaultInjectionConfig | None = None,
         metrics: KVStoreMetrics | None = None,
     ):
-        if not bucket:
-            raise ValueError("bucket must not be empty")
+        if (
+            not isinstance(bucket, str)
+            or not _BUCKET_RE.fullmatch(bucket)
+            or len(bucket.encode("utf-8")) > 255
+        ):
+            raise ValueError("bucket must be a bounded URI-authority-safe name")
+        if (
+            not isinstance(prefix, str)
+            or len(prefix.encode("utf-8")) > MAX_S3_PREFIX_BYTES
+            or any(ord(char) < 32 or ord(char) == 127 for char in prefix)
+        ):
+            raise ValueError("prefix must be a bounded string without control characters")
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.metadata_store = metadata_store
@@ -107,6 +120,7 @@ class S3Tier:
             metadata.bytes = len(data)
             metadata.last_access = time.time()
             metadata.validate(require_checksum=True)
+            self.metadata_store.validate_payload_descriptor(metadata)
             existing = self.lookup(key)
             if existing is not None:
                 loaded = self.load(key)
@@ -258,16 +272,21 @@ class S3Tier:
         if location.key is None or location.tier != self.name:
             raise MetadataMismatch("persisted S3 location key/tier mismatch")
         parsed = urlparse(location.uri)
-        object_key = parsed.path.lstrip("/")
+        encoded_key = parsed.path[1:] if parsed.path.startswith("/") else ""
+        try:
+            object_key = unquote(encoded_key, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise MetadataMismatch("persisted S3 location has invalid encoding") from exc
         if (
             parsed.scheme != "s3"
             or parsed.netloc != self.bucket
+            or parsed.params
             or parsed.query
             or parsed.fragment
+            or quote(object_key, safe="/") != encoded_key
             or object_key != self.object_key(location.key)
         ):
             raise MetadataMismatch("persisted S3 location is outside configured bucket/prefix")
-        # Keep percent escapes verbatim: they are literal characters in object_key().
         return self.bucket, object_key
 
     def _head_exists(self, object_key: str, bucket: str | None = None) -> bool:
@@ -286,7 +305,11 @@ class S3Tier:
             if _is_not_found(exc):
                 raise BlockNotFound(object_key) from exc
             raise TierUnavailable(f"s3 get_object failed: {exc}") from exc
-        raw = _read_body(obj["Body"])
+        try:
+            body = obj["Body"]
+        except (KeyError, TypeError) as exc:
+            raise TierUnavailable("s3 get_object response has no readable body") from exc
+        raw = _read_body(body)
         if len(raw) < len(MAGIC) + HEADER_LEN_STRUCT.size:
             raise ChecksumMismatch(object_key)
         if raw[: len(MAGIC)] != MAGIC:
@@ -314,7 +337,7 @@ class S3Tier:
         return BlockLocation(
             key=key,
             tier=self.name,
-            uri=f"s3://{self.bucket}/{object_key}",
+            uri=f"s3://{self.bucket}/{quote(object_key, safe='/')}",
             bytes=bytes_,
             checksum=checksum,
             created_at=created_at,
@@ -362,9 +385,43 @@ class S3Tier:
 def _read_body(body: Any) -> bytes:
     if isinstance(body, bytes):
         return body
-    if hasattr(body, "read"):
-        return body.read()
-    raise TierUnavailable("s3 body does not support read")
+    read = getattr(body, "read", None)
+    close = getattr(body, "close", None)
+    if not callable(read):
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                raise TierUnavailable("s3 body is unreadable and close failed") from exc
+        raise TierUnavailable("s3 body does not support read")
+
+    data: Any = None
+    read_error: Exception | None = None
+    close_error: Exception | None = None
+    try:
+        data = read()
+    except Exception as exc:
+        read_error = exc
+    finally:
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                close_error = exc
+
+    if read_error is not None:
+        unavailable = TierUnavailable("s3 response body read failed")
+        if close_error is not None:
+            # ``BaseException.add_note`` is only available on Python 3.11+.
+            # Preserve the secondary cleanup failure without raising the
+            # repository's documented Python floor above 3.10.
+            unavailable.close_error = close_error
+        raise unavailable from read_error
+    if close_error is not None:
+        raise TierUnavailable("s3 response body close failed") from close_error
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TierUnavailable("s3 response body read returned non-bytes data")
+    return bytes(data)
 
 
 def _is_not_found(exc: Exception) -> bool:

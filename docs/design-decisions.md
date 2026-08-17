@@ -44,7 +44,7 @@ Cache metadata is an observation that can become stale, arrive twice, or arrive 
 
 ### Decision
 
-Give locations an expiry, deduplicate non-empty event IDs, and track the highest positive producer sequence number per Worker separately from local revisions. Reads ignore expired locations. `ApplyEvent` rejects a positive sequence that is not strictly newer for that Worker; sequence zero remains available for internal local callers that do not claim ordered delivery. The admin event API requires a positive sequence.
+Give locations an expiry, validate an event before deduplication, deduplicate non-empty event IDs, and track the highest positive producer sequence number per Worker separately from local revisions. Reads ignore expired locations. `ApplyEvent` rejects a positive sequence that is not strictly newer for that Worker; sequence zero remains available for internal local callers that do not claim ordered delivery. The admin event API requires a positive sequence, and reserves the maximum signed sequence so a subsequent local revision remains representable.
 
 ### Alternatives
 
@@ -54,11 +54,11 @@ Give locations an expiry, deduplicate non-empty event IDs, and track the highest
 
 ### Failure semantics
 
-A repeated non-empty event ID becomes a no-op. On `ApplyEvent`, a positive sequence not newer than the Worker's accepted sequence is ignored; a zero sequence makes no ordering claim and does not advance the producer watermark. Expired locations can remain in the in-memory map until explicit eviction, overwrite, or reconstruction but do not count as overlap.
+An event rejected by `ApplyEvent` validation returns an error without consuming its event ID or advancing a watermark, so a corrected retry can be applied. A repeated valid non-empty event ID becomes a no-op. A valid event whose positive sequence is not newer than the Worker's accepted sequence is ignored but still consumes that immutable event ID; a zero sequence makes no ordering claim and does not advance the producer watermark. Expired locations can remain in the in-memory map until explicit eviction, overwrite, or reconstruction but do not count as overlap.
 
 ### Current guarantees
 
-Event application and location maps are lock-protected. Snapshot schema v2 persists producer watermarks separately from local revisions. Tests cover TTL, duplicate IDs, stale store/evict events, zero-sequence isolation, snapshots, and event replay.
+Event application and location maps are lock-protected. Snapshot schema v2 persists producer watermarks separately from local revisions. Tests cover TTL, duplicate IDs, corrected invalid-event retries, stale store/evict events, zero-sequence isolation, sequence bounds, snapshots, and event replay.
 
 ### Current limitations
 
@@ -88,7 +88,7 @@ Treat strategy selection as advisory. Reacquire the Worker mutex, find the selec
 
 ### Failure semantics
 
-If the Worker disappeared or is no longer routable at reservation time, the Router returns an unavailable error before sending upstream. It does not claim transparent failover. An upstream request or response-copy error still releases the lifecycle count through `defer`; the Router does not retry on another Worker, including after any stream bytes may have been written. An attempted in-place URL/topology mutation is rejected without changing the registration.
+If the Worker disappeared or is no longer routable at reservation time, the Router returns an unavailable error before sending upstream. It does not claim transparent failover. An upstream request or response-copy error still releases the lifecycle count through `defer`; the Router does not retry on another Worker, including after any stream bytes may have been written. Worker endpoints are explicit HTTP(S) URLs, and an upstream redirect is returned as a fixed Router error rather than followed. An attempted in-place URL/topology mutation is rejected without changing the registration.
 
 ### Current guarantees
 
@@ -112,7 +112,7 @@ Publishing metadata before bytes are completely available lets a concurrent look
 
 ### Decision
 
-Write the payload representation first, then commit the authoritative metadata record. The file-backed content-addressed layout writes a temporary file and atomically replaces the final path before metadata upsert. Segments append a complete header/payload record before metadata upsert. The S3-compatible tier uploads the object before metadata upsert. A physical payload without active metadata is not implicitly rehydrated. While active, a `BlockKey` is immutable: identical bytes plus the same dtype/shape/token descriptor are an idempotent replay, while conflicting bytes or descriptor fields are rejected before physical replacement. `BlockKey` uses a versioned canonical JSON namespace for SQLite and shared prefixed base64url components for file/S3-compatible keys; required fields and the lowercase SHA-256 block hash are validated before any path is generated.
+Write the payload representation first, then commit the authoritative metadata record. The file-backed content-addressed layout writes a temporary file and atomically replaces the final path before metadata upsert. Segments append a complete header/payload record before metadata upsert. The S3-compatible tier uploads the object before metadata upsert. A physical payload without active metadata is not implicitly rehydrated. Within one metadata database, an active `BlockKey` is immutable across tiers: identical bytes plus the same dtype/shape/token descriptor are an idempotent replay, while conflicting bytes or descriptor fields are rejected before physical replacement. `BlockKey` uses a versioned canonical JSON namespace for SQLite and shared prefixed base64url components for file/S3-compatible keys; required fields and the lowercase SHA-256 block hash are validated before any path is generated. S3 object keys stay literal at the client boundary while their persisted location paths use a strict canonical percent-encoding.
 
 ### Alternatives
 
@@ -126,7 +126,7 @@ A failure before metadata commit can leave an orphan payload, but normal lookup 
 
 ### Current guarantees
 
-Within one live metadata owner, mutation locking serializes competing store/delete operations. Metadata upsert enforces equality across the call key, metadata key, location key, length, checksum, and tier. Tests cover immutable active keys, failed metadata commit, orphan invisibility, adversarial namespace values, persisted-location boundaries for URIs, file roots, and buckets, bounded malformed headers, identity/length/checksum mismatch, and S3 unavailability as a separate class.
+Within one live metadata owner, mutation locking serializes competing store/delete operations. Metadata upsert enforces equality across the call key, metadata key, location key, length, checksum, and tier, and compares the payload descriptor with every active/deleting tier row for that key. Tests cover concurrent and sequential cross-tier conflicts, immutable active keys, failed metadata commit, orphan invisibility, adversarial namespace values, persisted-location boundaries and canonical encodings for URIs, file roots, and buckets, bounded malformed headers, identity/length/checksum mismatch, and S3 unavailability as a separate class.
 
 ### Current limitations
 
@@ -190,11 +190,11 @@ Represent those inputs in a small cost model. A synchronous `load` returns bytes
 
 ### Failure semantics
 
-Missing or corrupt payloads do not silently become hits. Record-format damage, metadata/identity mismatch, and checksum mismatch invalidate the source and propagate as corruption subclasses; an invalidation failure becomes `CorruptionCleanupFailed` with both the original corruption and cleanup cause preserved. The tier manager does not translate corruption into recomputation. Tested S3 HEAD/GET unavailability is instead isolated from healthy tiers and becomes a miss-like recompute result only when no usable location remains. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, and promotes to the requested target.
+Missing or corrupt payloads do not silently become hits. Record-format damage, metadata/identity mismatch, and checksum mismatch invalidate the source and propagate as corruption subclasses; an invalidation failure becomes `CorruptionCleanupFailed` with both the original corruption and cleanup cause preserved. The tier manager does not translate corruption into recomputation. Tested S3 HEAD, GET-call, body-read, and body-close unavailability is instead isolated from healthy tiers and becomes a miss-like recompute result only when no usable location remains. Every acquired streaming response body is closed. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, and promotes to the requested target.
 
 ### Current guarantees
 
-Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, promotion, structural/content corruption and cleanup classification, S3 lookup/load timeout fallback without hiding a healthy file tier, and Schema-validated tier-profile import.
+Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, promotion, structural/content corruption and cleanup classification, S3 lookup/call/body timeout fallback and response-body cleanup without hiding a healthy file tier, and Schema-validated tier-profile import.
 
 ### Current limitations
 

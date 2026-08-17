@@ -119,6 +119,7 @@ class NVMeTier:
             metadata.bytes = len(data)
             metadata.last_access = time.time()
             metadata.validate(require_checksum=True)
+            self.metadata_store.validate_payload_descriptor(metadata)
             existing = self.lookup(key)
             if existing is not None:
                 loaded = self.load(key)

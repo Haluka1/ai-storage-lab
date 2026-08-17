@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .errors import MetadataMismatch
+from .errors import ImmutableBlockConflict, MetadataMismatch
 from .metadata import BlockKey, BlockLocation, KVMetadata, TierName
 
 
@@ -167,6 +167,7 @@ class MetadataStore:
     def upsert(self, location: BlockLocation, metadata: KVMetadata) -> None:
         _validate_upsert(location, metadata)
         with self._mutation_lock, self._lock, self._conn:
+            self._validate_payload_descriptor_locked(metadata)
             state = self._conn.execute(
                 """
                 SELECT state, metadata_json FROM blocks
@@ -182,18 +183,6 @@ class MetadataStore:
                 raise RuntimeError(
                     "cannot upsert a block while its delete tombstone is pending"
                 )
-            if state is not None:
-                try:
-                    persisted = KVMetadata.from_dict(json.loads(str(state[1])))
-                    persisted.validate(require_checksum=True)
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise MetadataMismatch(
-                        "persisted metadata is structurally invalid"
-                    ) from exc
-                if persisted.payload_descriptor() != metadata.payload_descriptor():
-                    raise MetadataMismatch(
-                        "active BlockKey metadata descriptor cannot change"
-                    )
             self._conn.execute(
                 """
                 INSERT INTO blocks(
@@ -237,6 +226,42 @@ class MetadataStore:
                     self._owner_epoch,
                 ),
             )
+
+    def validate_payload_descriptor(self, metadata: KVMetadata) -> None:
+        """Reject a BlockKey descriptor that conflicts with any published tier.
+
+        Concrete tiers call this before materializing a new payload. ``upsert``
+        repeats the check as the publication guard so a concurrent store cannot
+        bypass it between preflight and metadata commit.
+        """
+
+        try:
+            metadata.validate(require_checksum=True)
+        except ValueError as exc:
+            raise MetadataMismatch("invalid metadata") from exc
+        with self._mutation_lock, self._lock:
+            self._validate_payload_descriptor_locked(metadata)
+
+    def _validate_payload_descriptor_locked(self, metadata: KVMetadata) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT metadata_json FROM blocks
+            WHERE block_hash=? AND namespace=?
+            """,
+            (metadata.key.block_hash, metadata.key.namespace()),
+        ).fetchall()
+        for row in rows:
+            try:
+                persisted = KVMetadata.from_dict(json.loads(str(row[0])))
+                persisted.validate(require_checksum=True)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise MetadataMismatch(
+                    "persisted metadata is structurally invalid"
+                ) from exc
+            if persisted.payload_descriptor() != metadata.payload_descriptor():
+                raise ImmutableBlockConflict(
+                    "active BlockKey payload descriptor cannot change across tiers"
+                )
 
     def lookup(self, key: BlockKey, tier: TierName | None = None) -> list[BlockLocation]:
         query = (
