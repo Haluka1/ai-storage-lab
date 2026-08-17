@@ -53,6 +53,8 @@ class LocalEngineSmokeTest(unittest.TestCase):
                 self.assertEqual({row["engine"] for row in rows}, {engine})
                 if engine != "odirect":
                     self.assertEqual({row["error"] for row in rows}, {""})
+                if engine == "mmap":
+                    self.assertEqual({int(row["bytes"]) for row in rows}, {256 * 1024})
 
 
 if __name__ == "__main__":

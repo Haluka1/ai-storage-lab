@@ -1,23 +1,37 @@
 from __future__ import annotations
 
-import json
 import os
-import struct
 import time
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
 from .checksum import sha256_hex, verify_sha256
-from .errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch, TierUnavailable
+from .errors import (
+    BlockNotFound,
+    ChecksumMismatch,
+    CorruptionCleanupFailed,
+    CorruptionDetected,
+    ImmutableBlockConflict,
+    MetadataMismatch,
+    RecordFormatError,
+    StoreFull,
+    TierUnavailable,
+)
 from .layout import storage_key_parts
 from .metadata import BlockKey, BlockLocation, KVMetadata, LoadResult, StoreResult, TierName
 from .metadata_store import MetadataStore
 from .metrics import KVStoreMetrics
+from .record import (
+    HEADER_LEN_STRUCT,
+    MAGIC,
+    MAX_HEADER_BYTES,
+    decode_record_header,
+    encode_record_header,
+)
 from .s3_fault_injection import FaultInjectingS3Client, S3FaultInjectionConfig
 
-MAGIC = b"KVBLK001"
-HEADER_LEN_STRUCT = struct.Struct(">I")
+MAX_S3_PAYLOAD_BYTES = 16 * 1024 * 1024 * 1024
 
 
 class S3Tier:
@@ -52,68 +66,81 @@ class S3Tier:
         self.client = _maybe_fault_inject(base_client, fault_injection)
 
     def lookup(self, key: BlockKey) -> BlockLocation | None:
-        object_key = self.object_key(key)
         locations = self.metadata_store.lookup(key, self.name)
         if locations:
-            if self._head_exists(object_key):
+            location = locations[0]
+            bucket, object_key = self._location_target(location)
+            if self._head_exists(object_key, bucket=bucket):
                 self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="hit"))
-                return locations[0]
+                return location
             # A store from another Tier instance may have replaced the object
             # after the optimistic HEAD.  Recheck while holding the shared
             # mutation boundary before deleting metadata as stale.
             with self.metadata_store.mutation():
                 locations = self.metadata_store.lookup(key, self.name)
-                if locations and self._head_exists(object_key):
-                    return locations[0]
+                if locations:
+                    bucket, object_key = self._location_target(locations[0])
+                    if self._head_exists(object_key, bucket=bucket):
+                        return locations[0]
                 self.metadata_store.delete(key, self.name)
             self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="stale"))
             return None
-        with self.metadata_store.mutation():
-            locations = self.metadata_store.lookup(key, self.name)
-            if locations:
-                return locations[0] if self._head_exists(object_key) else None
-            if self.metadata_store.is_deleting(key, self.name):
-                self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
-                return None
-            if not self._head_exists(object_key):
-                self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
-                return None
-            try:
-                metadata, header = self._read_metadata_header(object_key)
-            except BlockNotFound:
-                return None
-            if metadata.key != key:
-                return None
-            loc = self._location_for(key, object_key, int(header["payload_bytes"]), str(header["checksum"]), metadata.created_at, metadata.last_access)
-            self.metadata_store.upsert(loc, metadata)
-            return loc
+        # Object existence alone is not a publish operation. A payload left by
+        # a failed metadata commit remains an orphan until explicit recovery.
+        self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
+        return None
 
     def store(self, key: BlockKey, data: bytes, metadata: KVMetadata) -> StoreResult:
         start = time.perf_counter()
+        if metadata.key != key:
+            raise MetadataMismatch("store key does not match metadata key")
+        data = bytes(data)
+        if len(data) > MAX_S3_PAYLOAD_BYTES:
+            raise StoreFull("block exceeds S3 record protocol limit")
+        checksum = sha256_hex(data)
         with self.metadata_store.mutation():
             if self.metadata_store.is_deleting(key, self.name):
                 raise RuntimeError(
                     "cannot store a block while its delete tombstone is pending"
                 )
-            checksum = sha256_hex(data)
             metadata.checksum = checksum
             metadata.bytes = len(data)
             metadata.last_access = time.time()
-            header = {
-                "version": 1,
-                "checksum": checksum,
-                "payload_bytes": len(data),
-                "metadata": metadata.to_dict(),
-            }
-            encoded_header = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            body = MAGIC + HEADER_LEN_STRUCT.pack(len(encoded_header)) + encoded_header + data
-            object_key = self.object_key(key)
-            try:
-                self.client.put_object(Bucket=self.bucket, Key=object_key, Body=body, Metadata={"kv-sha256": checksum})
-            except Exception as exc:
-                raise TierUnavailable(f"s3 put_object failed: {exc}") from exc
-            loc = self._location_for(key, object_key, len(data), checksum, metadata.created_at, metadata.last_access)
-            self.metadata_store.upsert(loc, metadata)
+            metadata.validate(require_checksum=True)
+            existing = self.lookup(key)
+            if existing is not None:
+                loaded = self.load(key)
+                if loaded.data != data:
+                    raise ImmutableBlockConflict(
+                        f"{key.block_hash}: immutable BlockKey already has different payload"
+                    )
+                if (
+                    loaded.metadata.payload_descriptor()
+                    != metadata.payload_descriptor()
+                ):
+                    raise ImmutableBlockConflict(
+                        f"{key.block_hash}: immutable BlockKey metadata descriptor changed"
+                    )
+                existing.bytes = len(data)
+                existing.checksum = checksum
+                existing.last_access = metadata.last_access
+                self.metadata_store.upsert(existing, metadata)
+            else:
+                header = {
+                    "version": 1,
+                    "checksum": checksum,
+                    "payload_bytes": len(data),
+                    "metadata": metadata.to_dict(),
+                }
+                encoded_header = encode_record_header(header)
+                body = MAGIC + HEADER_LEN_STRUCT.pack(len(encoded_header)) + encoded_header + data
+                object_key = self.object_key(key)
+                try:
+                    self.client.put_object(Bucket=self.bucket, Key=object_key, Body=body, Metadata={"kv-sha256": checksum})
+                except Exception as exc:
+                    raise TierUnavailable(f"s3 put_object failed: {exc}") from exc
+                loc = self._location_for(key, object_key, len(data), checksum, metadata.created_at, metadata.last_access)
+                self.metadata_store.upsert(loc, metadata)
         latency_ms = (time.perf_counter() - start) * 1000
         self._metric(lambda m: m.kv_store_latency_seconds.observe(latency_ms / 1000.0, tier=self.name.value, outcome="ok"))
         self._metric(lambda m: m.kv_bytes_written_total.inc(len(data), tier=self.name.value, outcome="ok"))
@@ -121,33 +148,42 @@ class S3Tier:
 
     def load(self, key: BlockKey) -> LoadResult:
         start = time.perf_counter()
-        object_key = self.object_key(key)
         if self.lookup(key) is None:
             raise BlockNotFound(key.block_hash)
-        if self.metadata_store.lookup_and_acquire(key, self.name) is None:
+        location = self.metadata_store.lookup_and_acquire(key, self.name)
+        if location is None:
             raise BlockNotFound(key.block_hash)
-        corruption_error: ChecksumMismatch | None = None
+        corruption_error: CorruptionDetected | None = None
         try:
-            header, payload = self._read_object(object_key)
+            bucket, object_key = self._location_target(location)
+            header, payload = self._read_object(object_key, bucket=bucket)
             metadata = KVMetadata.from_dict(header["metadata"])
             if metadata.key != key:
                 raise MetadataMismatch(key.block_hash)
-            if len(payload) != int(header["payload_bytes"]):
-                self._metric(lambda m: m.kv_checksum_mismatch_total.inc(tier=self.name.value, outcome="error"))
-                raise ChecksumMismatch(key.block_hash)
+            if location.bytes != len(payload) or location.bytes != int(header["payload_bytes"]):
+                raise MetadataMismatch(f"{key.block_hash}: location byte count mismatch")
+            if location.checksum != str(header["checksum"]):
+                raise MetadataMismatch(f"{key.block_hash}: location checksum mismatch")
             if not verify_sha256(payload, str(header["checksum"])):
                 self._metric(lambda m: m.kv_checksum_mismatch_total.inc(tier=self.name.value, outcome="error"))
                 raise ChecksumMismatch(key.block_hash)
             metadata.checksum = str(header["checksum"])
             metadata.bytes = len(payload)
             self.metadata_store.touch(key, self.name)
-            metadata.last_access = time.time()
-            metadata.reuse_count += 1
+            persisted = self.metadata_store.get_metadata(key, self.name)
+            if persisted is None or persisted.key != key:
+                raise MetadataMismatch(key.block_hash)
+            if persisted.payload_descriptor() != metadata.payload_descriptor():
+                raise MetadataMismatch(
+                    f"{key.block_hash}: persisted metadata does not match payload header"
+                )
+            metadata.last_access = persisted.last_access
+            metadata.reuse_count = persisted.reuse_count
             latency_ms = (time.perf_counter() - start) * 1000
             self._metric(lambda m: m.kv_load_latency_seconds.observe(latency_ms / 1000.0, tier=self.name.value, outcome="ok"))
             self._metric(lambda m: m.kv_bytes_read_total.inc(len(payload), tier=self.name.value, outcome="ok"))
             return LoadResult(key, self.name, payload, metadata, latency_ms)
-        except ChecksumMismatch as exc:
+        except CorruptionDetected as exc:
             corruption_error = exc
             raise
         finally:
@@ -156,7 +192,10 @@ class S3Tier:
             except Exception as cleanup_error:
                 if corruption_error is not None:
                     raise CorruptionCleanupFailed(
-                        key.block_hash, "release", cleanup_error
+                        key.block_hash,
+                        "release",
+                        cleanup_error,
+                        corruption_error,
                     ) from corruption_error
                 raise
             if corruption_error is not None:
@@ -166,7 +205,10 @@ class S3Tier:
                         raise RuntimeError("corrupt S3 location remains active")
                 except Exception as cleanup_error:
                     raise CorruptionCleanupFailed(
-                        key.block_hash, "evict", cleanup_error
+                        key.block_hash,
+                        "evict",
+                        cleanup_error,
+                        corruption_error,
                     ) from corruption_error
 
     def evict(self, key: BlockKey) -> bool:
@@ -174,7 +216,7 @@ class S3Tier:
             location = self.metadata_store.begin_delete(key, self.name)
             if location is None:
                 return False
-            bucket, object_key = self._delete_target(location)
+            bucket, object_key = self._location_target(location)
             try:
                 self.client.delete_object(Bucket=bucket, Key=object_key)
             except Exception as exc:
@@ -212,12 +254,21 @@ class S3Tier:
         path = str(PurePosixPath(*storage_key_parts(key)))
         return f"{self.prefix}/{path}" if self.prefix else path
 
-    def _delete_target(self, location: BlockLocation) -> tuple[str, str]:
+    def _location_target(self, location: BlockLocation) -> tuple[str, str]:
+        if location.key is None or location.tier != self.name:
+            raise MetadataMismatch("persisted S3 location key/tier mismatch")
         parsed = urlparse(location.uri)
-        if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
-            raise TierUnavailable(f"invalid persisted s3 location: {location.uri}")
+        object_key = parsed.path.lstrip("/")
+        if (
+            parsed.scheme != "s3"
+            or parsed.netloc != self.bucket
+            or parsed.query
+            or parsed.fragment
+            or object_key != self.object_key(location.key)
+        ):
+            raise MetadataMismatch("persisted S3 location is outside configured bucket/prefix")
         # Keep percent escapes verbatim: they are literal characters in object_key().
-        return parsed.netloc, parsed.path.lstrip("/")
+        return self.bucket, object_key
 
     def _head_exists(self, object_key: str, bucket: str | None = None) -> bool:
         try:
@@ -228,13 +279,9 @@ class S3Tier:
                 return False
             raise TierUnavailable(f"s3 head_object failed: {exc}") from exc
 
-    def _read_metadata_header(self, object_key: str) -> tuple[KVMetadata, dict[str, Any]]:
-        header, _payload = self._read_object(object_key)
-        return KVMetadata.from_dict(header["metadata"]), header
-
-    def _read_object(self, object_key: str) -> tuple[dict[str, Any], bytes]:
+    def _read_object(self, object_key: str, bucket: str | None = None) -> tuple[dict[str, Any], bytes]:
         try:
-            obj = self.client.get_object(Bucket=self.bucket, Key=object_key)
+            obj = self.client.get_object(Bucket=bucket or self.bucket, Key=object_key)
         except Exception as exc:
             if _is_not_found(exc):
                 raise BlockNotFound(object_key) from exc
@@ -247,8 +294,20 @@ class S3Tier:
         offset = len(MAGIC)
         header_len = HEADER_LEN_STRUCT.unpack(raw[offset : offset + HEADER_LEN_STRUCT.size])[0]
         offset += HEADER_LEN_STRUCT.size
-        header = json.loads(raw[offset : offset + header_len].decode("utf-8"))
-        payload = raw[offset + header_len :]
+        if header_len <= 0 or header_len > MAX_HEADER_BYTES:
+            raise RecordFormatError(f"{object_key}: invalid record header length")
+        header_end = offset + header_len
+        if header_end > len(raw):
+            raise RecordFormatError(f"{object_key}: truncated record header")
+        header = decode_record_header(
+            raw[offset:header_end],
+            object_key,
+            max_payload_bytes=MAX_S3_PAYLOAD_BYTES,
+            require_layout_mode=False,
+        )
+        payload = raw[header_end:]
+        if len(payload) != int(header["payload_bytes"]):
+            raise ChecksumMismatch(f"{object_key}: payload length mismatch")
         return header, payload
 
     def _location_for(self, key: BlockKey, object_key: str, bytes_: int, checksum: str, created_at: float, last_access: float) -> BlockLocation:

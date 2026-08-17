@@ -104,6 +104,28 @@ func (idx *Index) Evict(block common.BlockHash, worker common.WorkerID, seqNo in
 	idx.evictLocked(block, worker, seqNo, true)
 }
 
+// EvictWorker removes every observation and producer watermark owned by a
+// retired Worker ID. A control plane must quiesce the old event producer
+// before reusing that ID; the public prototype does not implement Worker
+// generations.
+func (idx *Index) EvictWorker(worker common.WorkerID) int {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	removed := 0
+	for block, locations := range idx.byBlock {
+		if _, ok := locations[worker]; !ok {
+			continue
+		}
+		delete(locations, worker)
+		removed++
+		if len(locations) == 0 {
+			delete(idx.byBlock, block)
+		}
+	}
+	delete(idx.lastSeqByWorker, worker)
+	return removed
+}
+
 func (idx *Index) evictLocked(block common.BlockHash, worker common.WorkerID, seqNo int64, rejectStale bool) bool {
 	if rejectStale && !idx.seqFreshLocked(worker, seqNo) {
 		return false

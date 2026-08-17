@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import struct
 import tempfile
 import threading
 import time
@@ -12,14 +10,28 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .checksum import sha256_hex, verify_sha256
-from .errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch, StoreFull
+from .errors import (
+    BlockNotFound,
+    ChecksumMismatch,
+    CorruptionCleanupFailed,
+    CorruptionDetected,
+    ImmutableBlockConflict,
+    MetadataMismatch,
+    RecordFormatError,
+    StoreFull,
+)
 from .layout import ContentAddressedLayout, SegmentedLayout
 from .metadata import BlockKey, BlockLocation, KVMetadata, LoadResult, StoreResult, TierName
 from .metadata_store import MetadataStore
 from .metrics import KVStoreMetrics
+from .record import (
+    HEADER_LEN_STRUCT,
+    MAGIC,
+    MAX_HEADER_BYTES,
+    decode_record_header,
+    encode_record_header,
+)
 
-MAGIC = b"KVBLK001"
-HEADER_LEN_STRUCT = struct.Struct(">I")
 DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
 
 
@@ -71,10 +83,11 @@ class NVMeTier:
     def lookup(self, key: BlockKey) -> BlockLocation | None:
         locations = self.metadata_store.lookup(key, self.name)
         if locations:
-            exists = self._location_exists(locations[0])
+            location = locations[0]
+            exists = self._location_exists(location)
             self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="hit" if exists else "stale"))
             if exists:
-                return locations[0]
+                return location
             with self.metadata_store.mutation():
                 locations = self.metadata_store.lookup(key, self.name)
                 if locations and self._location_exists(locations[0]):
@@ -84,34 +97,17 @@ class NVMeTier:
         if self.metadata_store.is_deleting(key, self.name):
             self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
             return None
-        if self.layout_mode == "segment":
-            self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
-            return None
-        with self.metadata_store.mutation():
-            # Recheck after entering the shared mutation boundary.  A second
-            # Tier instance may have installed a tombstone after the optimistic
-            # lookup above.
-            locations = self.metadata_store.lookup(key, self.name)
-            if locations:
-                if self._location_exists(locations[0]):
-                    return locations[0]
-                self.metadata_store.delete(key, self.name)
-                return None
-            if self.metadata_store.is_deleting(key, self.name):
-                return None
-            path = self.layout.block_path(key)
-            if not path.exists():
-                self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
-                return None
-            metadata, header = self._read_metadata_header(path)
-            if metadata.key != key:
-                return None
-            loc = self._location_for(key, path, int(header["payload_bytes"]), str(header["checksum"]), metadata.created_at, metadata.last_access)
-            self.metadata_store.upsert(loc, metadata)
-            return loc
+        # A complete self-describing payload without metadata is an orphan, not
+        # an implicitly published block. Recovery must be an explicit policy.
+        self._metric(lambda m: m.kv_lookup_total.inc(tier=self.name.value, outcome="miss"))
+        return None
 
     def store(self, key: BlockKey, data: bytes, metadata: KVMetadata) -> StoreResult:
         start = time.perf_counter()
+        if metadata.key != key:
+            raise MetadataMismatch("store key does not match metadata key")
+        data = bytes(data)
+        checksum = sha256_hex(data)
         with self.metadata_store.mutation(), self._capacity_lock:
             if self.metadata_store.is_deleting(key, self.name):
                 raise RuntimeError(
@@ -119,45 +115,62 @@ class NVMeTier:
                 )
             if len(data) > self.max_bytes:
                 raise StoreFull("block exceeds nvme tier capacity")
-            self._ensure_capacity(len(data), exclude=key)
-            checksum = sha256_hex(data)
             metadata.checksum = checksum
             metadata.bytes = len(data)
             metadata.last_access = time.time()
-            header = {
-                "version": 1,
-                "layout_mode": self.layout_mode,
-                "checksum": checksum,
-                "payload_bytes": len(data),
-                "metadata": metadata.to_dict(),
-            }
-            encoded_header = json.dumps(
-                header, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-            if self.layout_mode == "segment":
-                ref = self._append_segment_record(key, encoded_header, data)
-                loc = self._segment_location_for(
-                    key,
-                    ref,
-                    len(data),
-                    checksum,
-                    metadata.created_at,
-                    metadata.last_access,
-                )
+            metadata.validate(require_checksum=True)
+            existing = self.lookup(key)
+            if existing is not None:
+                loaded = self.load(key)
+                if loaded.data != data:
+                    raise ImmutableBlockConflict(
+                        f"{key.block_hash}: immutable BlockKey already has different payload"
+                    )
+                if (
+                    loaded.metadata.payload_descriptor()
+                    != metadata.payload_descriptor()
+                ):
+                    raise ImmutableBlockConflict(
+                        f"{key.block_hash}: immutable BlockKey metadata descriptor changed"
+                    )
+                existing.bytes = len(data)
+                existing.checksum = checksum
+                existing.last_access = metadata.last_access
+                self.metadata_store.upsert(existing, metadata)
             else:
-                path = self.layout.block_path(key)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = self._write_tmp(path, encoded_header, data)
-                os.replace(tmp_path, path)
-                loc = self._location_for(
-                    key,
-                    path,
-                    len(data),
-                    checksum,
-                    metadata.created_at,
-                    metadata.last_access,
-                )
-            self.metadata_store.upsert(loc, metadata)
+                self._ensure_capacity(len(data), exclude=key)
+                header = {
+                    "version": 1,
+                    "layout_mode": self.layout_mode,
+                    "checksum": checksum,
+                    "payload_bytes": len(data),
+                    "metadata": metadata.to_dict(),
+                }
+                encoded_header = encode_record_header(header)
+                if self.layout_mode == "segment":
+                    ref = self._append_segment_record(key, encoded_header, data)
+                    loc = self._segment_location_for(
+                        key,
+                        ref,
+                        len(data),
+                        checksum,
+                        metadata.created_at,
+                        metadata.last_access,
+                    )
+                else:
+                    path = self.layout.block_path(key)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = self._write_tmp(path, encoded_header, data)
+                    os.replace(tmp_path, path)
+                    loc = self._location_for(
+                        key,
+                        path,
+                        len(data),
+                        checksum,
+                        metadata.created_at,
+                        metadata.last_access,
+                    )
+                self.metadata_store.upsert(loc, metadata)
         latency_ms = (time.perf_counter() - start) * 1000
         self._metric(
             lambda m: m.kv_store_latency_seconds.observe(
@@ -178,19 +191,11 @@ class NVMeTier:
         loc = self.metadata_store.lookup_and_acquire(key, self.name)
         if loc is None:
             raise BlockNotFound(key.block_hash)
-        corruption_error: ChecksumMismatch | None = None
+        corruption_error: CorruptionDetected | None = None
         try:
             header, payload = self._read_location(loc)
             metadata = KVMetadata.from_dict(header["metadata"])
-            if metadata.key != key:
-                raise MetadataMismatch(key.block_hash)
-            if len(payload) != int(header["payload_bytes"]):
-                self._metric(
-                    lambda m: m.kv_checksum_mismatch_total.inc(
-                        tier=self.name.value, outcome="error"
-                    )
-                )
-                raise ChecksumMismatch(key.block_hash)
+            self._validate_loaded_record(key, loc, header, payload, metadata)
             if not verify_sha256(payload, str(header["checksum"])):
                 self._metric(
                     lambda m: m.kv_checksum_mismatch_total.inc(
@@ -202,9 +207,14 @@ class NVMeTier:
             metadata.bytes = len(payload)
             self.metadata_store.touch(key, self.name)
             persisted = self.metadata_store.get_metadata(key, self.name)
-            if persisted is not None:
-                metadata.last_access = persisted.last_access
-                metadata.reuse_count = persisted.reuse_count
+            if persisted is None or persisted.key != key:
+                raise MetadataMismatch(key.block_hash)
+            if persisted.payload_descriptor() != metadata.payload_descriptor():
+                raise MetadataMismatch(
+                    f"{key.block_hash}: persisted metadata does not match payload header"
+                )
+            metadata.last_access = persisted.last_access
+            metadata.reuse_count = persisted.reuse_count
             latency_ms = (time.perf_counter() - start) * 1000
             self._metric(
                 lambda m: m.kv_load_latency_seconds.observe(
@@ -217,7 +227,7 @@ class NVMeTier:
                 )
             )
             return LoadResult(key, self.name, payload, metadata, latency_ms)
-        except ChecksumMismatch as exc:
+        except CorruptionDetected as exc:
             corruption_error = exc
             raise
         finally:
@@ -226,7 +236,10 @@ class NVMeTier:
             except Exception as cleanup_error:
                 if corruption_error is not None:
                     raise CorruptionCleanupFailed(
-                        key.block_hash, "release", cleanup_error
+                        key.block_hash,
+                        "release",
+                        cleanup_error,
+                        corruption_error,
                     ) from corruption_error
                 raise
             if corruption_error is not None:
@@ -236,7 +249,10 @@ class NVMeTier:
                         raise RuntimeError("corrupt file location remains active")
                 except Exception as cleanup_error:
                     raise CorruptionCleanupFailed(
-                        key.block_hash, "evict", cleanup_error
+                        key.block_hash,
+                        "evict",
+                        cleanup_error,
+                        corruption_error,
                     ) from corruption_error
 
     def evict(self, key: BlockKey) -> bool:
@@ -244,13 +260,14 @@ class NVMeTier:
             location = self.metadata_store.begin_delete(key, self.name)
             if location is None:
                 return False
-            if location.uri.startswith("segment://"):
+            target = self._validated_location_target(location)
+            if isinstance(target, SegmentRef):
                 # A segment record is append-only and is made unreachable by the
                 # metadata tombstone.  Offline compaction reclaims its bytes.
                 if not self.metadata_store.finish_delete(key, self.name):
                     raise RuntimeError("delete tombstone disappeared before metadata commit")
                 return True
-            path = self._path_from_location(location) or self.layout.block_path(key)
+            path = target
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -332,7 +349,15 @@ class NVMeTier:
                         continue
                     header, payload = self._read_location(loc)
                     header_metadata = KVMetadata.from_dict(header["metadata"])
-                    if header_metadata.key != loc.key:
+                    try:
+                        snapshot_metadata.validate(require_checksum=True)
+                    except ValueError as exc:
+                        raise MetadataMismatch(loc.key.block_hash) from exc
+                    if (
+                        header_metadata.key != loc.key
+                        or header_metadata.payload_descriptor()
+                        != snapshot_metadata.payload_descriptor()
+                    ):
                         raise MetadataMismatch(loc.key.block_hash)
                     if len(payload) != int(header["payload_bytes"]) or not verify_sha256(payload, str(header["checksum"])):
                         raise ChecksumMismatch(loc.key.block_hash)
@@ -341,7 +366,7 @@ class NVMeTier:
                     metadata.bytes = len(payload)
                     metadata.last_access = loc.last_access
                     header["metadata"] = metadata.to_dict()
-                    encoded_header = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    encoded_header = encode_record_header(header)
                     ref = self._append_compacted_segment_record(loc.key, encoded_header, payload, compaction_id)
                     new_loc = self._segment_location_for(loc.key, ref, len(payload), str(header["checksum"]), loc.created_at, loc.last_access)
                     self.metadata_store.upsert(new_loc, metadata)
@@ -480,14 +505,10 @@ class NVMeTier:
         return namespace_dir / f"compact-{compaction_id}-000000.kvseg"
 
     def _read_location(self, location: BlockLocation) -> tuple[dict[str, Any], bytes]:
-        if location.uri.startswith("segment://"):
-            try:
-                ref = self._segment_ref_from_uri(location.uri)
-            except ValueError as exc:
-                raise ChecksumMismatch(location.key.block_hash) from exc
-            return self._read_segment_record(ref)
-        path = self._path_from_location(location) or self.layout.block_path(location.key)
-        return self._read_file(path)
+        target = self._validated_location_target(location)
+        if isinstance(target, SegmentRef):
+            return self._read_segment_record(target)
+        return self._read_file(target)
 
     def _read_segment_record(self, ref: SegmentRef) -> tuple[dict[str, Any], bytes]:
         with ref.path.open("rb") as f:
@@ -498,14 +519,11 @@ class NVMeTier:
                 raise ChecksumMismatch(str(ref.path))
         return header, payload
 
-    def _read_metadata_header(self, path: Path) -> tuple[KVMetadata, dict[str, Any]]:
-        with path.open("rb") as f:
-            header, _payload = self._read_record(f, str(path), read_payload=False)
-        return KVMetadata.from_dict(header["metadata"]), header
-
     def _read_file(self, path: Path) -> tuple[dict[str, Any], bytes]:
         with path.open("rb") as f:
             header, payload = self._read_record(f, str(path))
+            if f.read(1):
+                raise RecordFormatError(f"{path}: trailing bytes after payload")
         return header, payload
 
     def _read_record(self, f, source: str, read_payload: bool = True) -> tuple[dict[str, Any], bytes]:
@@ -514,39 +532,61 @@ class NVMeTier:
             raise ChecksumMismatch(source)
         raw_len = f.read(HEADER_LEN_STRUCT.size)
         if len(raw_len) != HEADER_LEN_STRUCT.size:
-            raise ChecksumMismatch(source)
+            raise RecordFormatError(f"{source}: truncated header length")
         header_len = HEADER_LEN_STRUCT.unpack(raw_len)[0]
+        if header_len <= 0 or header_len > MAX_HEADER_BYTES:
+            raise RecordFormatError(f"{source}: invalid record header length")
         raw_header = f.read(header_len)
         if len(raw_header) != header_len:
-            raise ChecksumMismatch(source)
-        header = json.loads(raw_header.decode("utf-8"))
+            raise RecordFormatError(f"{source}: truncated record header")
+        header = decode_record_header(
+            raw_header,
+            source,
+            max_payload_bytes=self.max_bytes,
+            require_layout_mode=True,
+        )
         if not read_payload:
             return header, b""
         payload = f.read(int(header["payload_bytes"]))
+        if len(payload) != int(header["payload_bytes"]):
+            raise ChecksumMismatch(f"{source}: truncated payload")
         return header, payload
 
     def _location_exists(self, location: BlockLocation) -> bool:
-        if location.uri.startswith("segment://"):
-            try:
-                ref = self._segment_ref_from_uri(location.uri)
-            except ValueError:
-                return False
-            return ref.path.exists() and ref.offset + ref.record_bytes <= ref.path.stat().st_size
-        path = self._path_from_location(location) or self.layout.block_path(location.key)
-        return path.exists()
+        target = self._validated_location_target(location)
+        if isinstance(target, SegmentRef):
+            return (
+                target.path.exists()
+                and target.offset + target.record_bytes <= target.path.stat().st_size
+            )
+        return target.exists()
 
-    def _path_from_location(self, location: BlockLocation) -> Path | None:
-        if not location.uri.startswith("file://"):
-            return None
+    def _path_from_location(self, location: BlockLocation) -> Path:
         parsed = urlparse(location.uri)
-        return Path(unquote(parsed.path))
+        if (
+            parsed.scheme != "file"
+            or parsed.netloc not in {"", "localhost"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise MetadataMismatch("invalid persisted file location")
+        path = Path(unquote(parsed.path)).resolve(strict=False)
+        try:
+            expected = self.layout.block_path(location.key)
+        except ValueError as exc:
+            raise MetadataMismatch(
+                "canonical file location escapes the configured root"
+            ) from exc
+        if path != expected:
+            raise MetadataMismatch("persisted file location is not canonical")
+        return path
 
     def _segment_uri(self, ref: SegmentRef) -> str:
         return f"segment://{quote(str(ref.path), safe='/')}?offset={ref.offset}&record_bytes={ref.record_bytes}"
 
-    def _segment_ref_from_uri(self, uri: str) -> SegmentRef:
+    def _segment_ref_from_uri(self, uri: str, key: BlockKey | None = None) -> SegmentRef:
         parsed = urlparse(uri)
-        if parsed.scheme != "segment":
+        if parsed.scheme != "segment" or parsed.netloc or parsed.fragment:
             raise ValueError("not a segment uri")
         query = parse_qs(parsed.query)
         try:
@@ -556,7 +596,54 @@ class NVMeTier:
             raise ValueError("invalid segment uri") from exc
         if offset < 0 or record_bytes <= 0:
             raise ValueError("invalid segment bounds")
-        return SegmentRef(Path(unquote(parsed.path)), offset, record_bytes)
+        if record_bytes > len(MAGIC) + HEADER_LEN_STRUCT.size + MAX_HEADER_BYTES + self.max_bytes:
+            raise ValueError("segment record exceeds configured bounds")
+        path = Path(unquote(parsed.path)).resolve(strict=False)
+        root = self.segment_layout.root_dir
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("segment path escapes configured root") from exc
+        if key is not None:
+            namespace_dir = self.segment_layout.namespace_dir(key)
+            if path.parent != namespace_dir or path.suffix != ".kvseg":
+                raise ValueError("segment path is not canonical for BlockKey")
+        return SegmentRef(path, offset, record_bytes)
+
+    def _validated_location_target(
+        self, location: BlockLocation
+    ) -> Path | SegmentRef:
+        if location.key is None or location.tier != self.name:
+            raise MetadataMismatch("persisted location key/tier mismatch")
+        if self.layout_mode == "segment":
+            try:
+                return self._segment_ref_from_uri(location.uri, location.key)
+            except ValueError as exc:
+                raise MetadataMismatch("invalid persisted segment location") from exc
+        if urlparse(location.uri).scheme != "file":
+            raise MetadataMismatch("content-addressed tier requires a file URI")
+        return self._path_from_location(location)
+
+    def _validate_loaded_record(
+        self,
+        key: BlockKey,
+        location: BlockLocation,
+        header: dict[str, Any],
+        payload: bytes,
+        metadata: KVMetadata,
+    ) -> None:
+        expected_layout = (
+            "segment" if isinstance(self._validated_location_target(location), SegmentRef)
+            else "content_addressed"
+        )
+        if header.get("layout_mode") != expected_layout:
+            raise RecordFormatError(f"{key.block_hash}: record layout mismatch")
+        if metadata.key != key:
+            raise MetadataMismatch(key.block_hash)
+        if location.bytes != len(payload) or location.bytes != int(header["payload_bytes"]):
+            raise MetadataMismatch(f"{key.block_hash}: location byte count mismatch")
+        if location.checksum != str(header["checksum"]):
+            raise MetadataMismatch(f"{key.block_hash}: location checksum mismatch")
 
     def _physical_bytes(self) -> int:
         if not self.root_dir.exists():
@@ -570,9 +657,13 @@ class NVMeTier:
             if not loc.uri.startswith("segment://"):
                 continue
             try:
-                referenced.add(self._segment_ref_from_uri(loc.uri).path)
-            except ValueError:
-                continue
+                referenced.add(self._segment_ref_from_uri(loc.uri, loc.key).path)
+            except ValueError as exc:
+                # A destructive compaction pass must fail closed when its
+                # persisted reference set cannot be validated.
+                raise MetadataMismatch(
+                    "invalid persisted segment location during compaction"
+                ) from exc
         removed = 0
         removed_bytes = 0
         if not self.segment_layout.root_dir.exists():

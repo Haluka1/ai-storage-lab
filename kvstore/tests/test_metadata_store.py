@@ -9,8 +9,12 @@ import time
 import unittest
 from pathlib import Path
 
+from kvstore.errors import MetadataMismatch
 from kvstore.metadata import BlockKey, BlockLocation, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
+
+CHECKSUM_A = "a" * 64
+CHECKSUM_B = "b" * 64
 
 
 class MetadataStoreTest(unittest.TestCase):
@@ -23,9 +27,9 @@ class MetadataStoreTest(unittest.TestCase):
             for key, uri in [(key_a, "memory://a"), (key_b, "memory://b")]:
                 store.upsert(
                     BlockLocation(
-                        key, TierName.MEMORY, uri, 4, "abcd", time.time(), time.time()
+                        key, TierName.MEMORY, uri, 4, CHECKSUM_A, time.time(), time.time()
                     ),
-                    KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum="abcd"),
+                    KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A),
                 )
             self.assertEqual(store.lookup(key_a, TierName.MEMORY)[0].uri, "memory://a")
             self.assertEqual(store.lookup(key_b, TierName.MEMORY)[0].uri, "memory://b")
@@ -34,8 +38,8 @@ class MetadataStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
             key = BlockKey("t", "m", "r", "tok", "a" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum="abcd")
-            loc = BlockLocation(key, TierName.MEMORY, "memory://x", 4, "abcd", time.time(), time.time())
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
+            loc = BlockLocation(key, TierName.MEMORY, "memory://x", 4, CHECKSUM_A, time.time(), time.time())
             store.upsert(loc, meta)
             self.assertEqual(len(store.lookup(key)), 1)
             store.acquire(key, TierName.MEMORY)
@@ -47,13 +51,15 @@ class MetadataStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
             key = BlockKey("t", "m", "r", "tok", "b" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, reuse_count=2)
+            meta = KVMetadata(
+                key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A, reuse_count=2
+            )
             loc = BlockLocation(
                 key,
                 TierName.NVME,
                 "file:///tmp/x",
                 4,
-                "abcd",
+                CHECKSUM_A,
                 time.time(),
                 time.time(),
                 locality="same_zone",
@@ -81,9 +87,9 @@ class MetadataStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
             key = BlockKey("t", "m", "r", "tok", "c" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.MEMORY, "memory://c", 4, "abcd", time.time(), time.time()
+                key, TierName.MEMORY, "memory://c", 4, CHECKSUM_A, time.time(), time.time()
             )
             store.upsert(loc, meta)
             self.assertIsNotNone(store.lookup_and_acquire(key, TierName.MEMORY))
@@ -106,9 +112,9 @@ class MetadataStoreTest(unittest.TestCase):
             db_path = Path(td) / "meta.sqlite3"
             alias_path = Path(td) / "alias.sqlite3"
             key = BlockKey("t", "m", "r", "tok", "f" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.NVME, "file:///tmp/f", 4, "abcd", time.time(), time.time()
+                key, TierName.NVME, "file:///tmp/f", 4, CHECKSUM_A, time.time(), time.time()
             )
             store = MetadataStore(db_path)
             store.upsert(loc, meta)
@@ -127,9 +133,9 @@ class MetadataStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "meta.sqlite3"
             key = BlockKey("t", "m", "r", "tok", "1" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.NVME, "file:///tmp/legacy", 4, "abcd", time.time(), time.time()
+                key, TierName.NVME, "file:///tmp/legacy", 4, CHECKSUM_A, time.time(), time.time()
             )
             store = MetadataStore(db_path)
             store.upsert(loc, meta)
@@ -158,9 +164,9 @@ class MetadataStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "meta.sqlite3"
             key = BlockKey("t", "m", "r", "tok", "d" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.NVME, "file:///tmp/d", 4, "abcd", time.time(), time.time()
+                key, TierName.NVME, "file:///tmp/d", 4, CHECKSUM_A, time.time(), time.time()
             )
             store = MetadataStore(db_path)
             store.upsert(loc, meta)
@@ -200,9 +206,9 @@ os._exit(0)
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "meta.sqlite3"
             key = BlockKey("t", "m", "r", "tok", "e" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.S3, "s3://bucket/e", 4, "abcd", time.time(), time.time()
+                key, TierName.S3, "s3://bucket/e", 4, CHECKSUM_A, time.time(), time.time()
             )
             store = MetadataStore(db_path)
             store.upsert(loc, meta)
@@ -225,9 +231,9 @@ os._exit(0)
         with tempfile.TemporaryDirectory() as td:
             store = MetadataStore(Path(td) / "meta.sqlite3")
             key = BlockKey("t", "m", "r", "tok", "2" * 64)
-            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4)
+            meta = KVMetadata(key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A)
             loc = BlockLocation(
-                key, TierName.S3, "s3://bucket/object", 4, "abcd", time.time(), time.time()
+                key, TierName.S3, "s3://bucket/object", 4, CHECKSUM_A, time.time(), time.time()
             )
             store.upsert(loc, meta)
             self.assertIsNotNone(store.begin_delete(key, TierName.S3))
@@ -238,6 +244,83 @@ os._exit(0)
             self.assertTrue(store.is_deleting(key, TierName.S3))
             self.assertEqual(store.lookup(key, TierName.S3), [])
             store.close()
+
+    def test_upsert_rejects_cross_object_identity_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            key_a = BlockKey("t", "m", "r", "tok", "3" * 64)
+            key_b = BlockKey("t", "m", "r", "tok", "4" * 64)
+            meta = KVMetadata(
+                key_a, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A
+            )
+
+            invalid_locations = [
+                BlockLocation(
+                    key_b,
+                    TierName.MEMORY,
+                    "memory://block/other",
+                    4,
+                    CHECKSUM_A,
+                    time.time(),
+                    time.time(),
+                ),
+                BlockLocation(
+                    key_a,
+                    TierName.MEMORY,
+                    "memory://block/a",
+                    5,
+                    CHECKSUM_A,
+                    time.time(),
+                    time.time(),
+                ),
+                BlockLocation(
+                    key_a,
+                    TierName.MEMORY,
+                    "memory://block/a",
+                    4,
+                    CHECKSUM_B,
+                    time.time(),
+                    time.time(),
+                ),
+            ]
+
+            for location in invalid_locations:
+                with self.subTest(location=location):
+                    with self.assertRaises(MetadataMismatch):
+                        store.upsert(location, meta)
+
+            self.assertEqual(store.lookup(key_a), [])
+            self.assertEqual(store.lookup(key_b), [])
+
+    def test_active_metadata_payload_descriptor_cannot_change(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            key = BlockKey("t", "m", "r", "tok", "5" * 64)
+            location = BlockLocation(
+                key,
+                TierName.MEMORY,
+                "memory://block/value",
+                4,
+                CHECKSUM_A,
+                time.time(),
+                time.time(),
+            )
+            store.upsert(
+                location,
+                KVMetadata(
+                    key, "bf16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                MetadataMismatch, "descriptor cannot change"
+            ):
+                store.upsert(
+                    location,
+                    KVMetadata(
+                        key, "fp16", 1, 1, 1, 1, 4, checksum=CHECKSUM_A
+                    ),
+                )
 
 
 if __name__ == "__main__":

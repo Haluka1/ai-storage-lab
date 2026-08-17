@@ -10,10 +10,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from kvstore.errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, MetadataMismatch
-from kvstore.metadata import BlockKey, KVMetadata
+from kvstore.errors import (
+    BlockNotFound,
+    ChecksumMismatch,
+    CorruptionCleanupFailed,
+    ImmutableBlockConflict,
+    MetadataMismatch,
+    RecordFormatError,
+)
+from kvstore.metadata import BlockKey, BlockLocation, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
 from kvstore.nvme_tier import HEADER_LEN_STRUCT, MAGIC, NVMeTier
+from kvstore.record import MAX_HEADER_BYTES
 
 
 class NVMeTierTest(unittest.TestCase):
@@ -34,6 +42,119 @@ class NVMeTierTest(unittest.TestCase):
             self.assertEqual(list((Path(td) / "nvme").rglob("*.tmp")), [])
             self.assertTrue(tier.evict(key))
             self.assertIsNone(tier.lookup(key))
+
+    def test_store_rejects_cross_key_metadata_and_conflicting_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key_a = _key("identity-a")
+            key_b = _key("identity-b")
+
+            with self.assertRaises(MetadataMismatch):
+                tier.store(key_a, b"payload", _metadata(key_b, 7))
+
+            tier.store(key_a, b"payload", _metadata(key_a, 7))
+            tier.store(key_a, b"payload", _metadata(key_a, 7))
+            with self.assertRaises(ImmutableBlockConflict):
+                tier.store(key_a, b"changed", _metadata(key_a, 7))
+            changed_metadata = _metadata(key_a, 7)
+            changed_metadata.dtype = "fp16"
+            with self.assertRaises(ImmutableBlockConflict):
+                tier.store(key_a, b"payload", changed_metadata)
+            self.assertEqual(tier.load(key_a).data, b"payload")
+
+    def test_failed_metadata_commit_leaves_payload_orphan_invisible(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key = _key("orphan")
+
+            with mock.patch.object(
+                store, "upsert", side_effect=RuntimeError("metadata commit failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "metadata commit failed"):
+                    tier.store(key, b"payload", _metadata(key, 7))
+
+            self.assertTrue(tier.layout.block_path(key).exists())
+            self.assertIsNone(tier.lookup(key))
+            with self.assertRaises(BlockNotFound):
+                tier.load(key)
+
+    def test_store_rejects_oversized_header_before_writing_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key = _key("oversized-header")
+            metadata = _metadata(key, 7)
+            metadata.extra = {"oversized": "x" * (MAX_HEADER_BYTES + 1)}
+
+            with self.assertRaisesRegex(ValueError, "protocol limit"):
+                tier.store(key, b"payload", metadata)
+
+            self.assertFalse(tier.layout.block_path(key).exists())
+            self.assertIsNone(tier.lookup(key))
+
+    def test_persisted_file_uri_outside_root_is_rejected_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = MetadataStore(root / "meta.sqlite3")
+            tier = NVMeTier(root / "nvme", 1024, store)
+            key = _key("outside-file")
+            tier.store(key, b"payload", _metadata(key, 7))
+            canonical = store.lookup(key, TierName.NVME)[0]
+            metadata = store.get_metadata(key, TierName.NVME)
+            outside = root / "outside.kv"
+            outside.write_bytes(b"do-not-delete")
+            store.upsert(
+                BlockLocation(
+                    key,
+                    TierName.NVME,
+                    outside.as_uri(),
+                    canonical.bytes,
+                    canonical.checksum,
+                    canonical.created_at,
+                    canonical.last_access,
+                ),
+                metadata,
+            )
+
+            with self.assertRaises(MetadataMismatch):
+                tier.lookup(key)
+            with self.assertRaises(MetadataMismatch):
+                tier.evict(key)
+
+            self.assertEqual(outside.read_bytes(), b"do-not-delete")
+
+    def test_persisted_segment_uri_outside_root_is_rejected_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = MetadataStore(root / "meta.sqlite3")
+            tier = NVMeTier(root / "nvme", 1024, store, layout_mode="segment")
+            key = _key("outside-segment")
+            tier.store(key, b"payload", _metadata(key, 7))
+            canonical = store.lookup(key, TierName.NVME)[0]
+            metadata = store.get_metadata(key, TierName.NVME)
+            outside = root / "outside.kvseg"
+            outside.write_bytes(b"do-not-delete")
+            store.upsert(
+                BlockLocation(
+                    key,
+                    TierName.NVME,
+                    f"segment://{outside}?offset=0&record_bytes=13",
+                    canonical.bytes,
+                    canonical.checksum,
+                    canonical.created_at,
+                    canonical.last_access,
+                ),
+                metadata,
+            )
+
+            with self.assertRaises(MetadataMismatch):
+                tier.lookup(key)
+            with self.assertRaises(MetadataMismatch):
+                tier.evict(key)
+
+            self.assertEqual(outside.read_bytes(), b"do-not-delete")
 
     def test_concurrent_stores_respect_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -75,6 +196,76 @@ class NVMeTierTest(unittest.TestCase):
             _write_raw(path, header, b"corrupt")
             with self.assertRaises(ChecksumMismatch):
                 tier.load(key)
+            self.assertIsNone(tier.lookup(key))
+
+    def test_location_checksum_must_match_payload_header(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key = _key("location-checksum")
+            tier.store(key, b"payload", _metadata(key, 7))
+            path = tier.layout.block_path(key)
+            header, payload = _read_raw(path)
+            header["checksum"] = "0" * 64
+            header["metadata"]["checksum"] = "0" * 64
+            _write_raw(path, header, payload)
+
+            with self.assertRaises(MetadataMismatch):
+                tier.load(key)
+
+            self.assertIsNone(tier.lookup(key))
+
+    def test_structural_header_corruption_invalidates_location(self) -> None:
+        corrupt_records = [
+            MAGIC + HEADER_LEN_STRUCT.pack(len(b"{not-json")) + b"{not-json",
+            MAGIC + HEADER_LEN_STRUCT.pack(MAX_HEADER_BYTES + 1),
+            _encoded_record(
+                {
+                    "version": 999,
+                    "layout_mode": "content_addressed",
+                    "checksum": "0" * 64,
+                    "payload_bytes": 7,
+                    "metadata": {},
+                },
+                b"payload",
+            ),
+            _encoded_record(
+                {
+                    "version": 1,
+                    "layout_mode": "content_addressed",
+                    "checksum": "0" * 64,
+                    "metadata": {},
+                },
+                b"payload",
+            ),
+        ]
+        for index, raw in enumerate(corrupt_records):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as td:
+                store = MetadataStore(Path(td) / "meta.sqlite3")
+                tier = NVMeTier(Path(td) / "nvme", 1024, store)
+                key = _key(f"bad-header-{index}")
+                tier.store(key, b"payload", _metadata(key, 7))
+                tier.layout.block_path(key).write_bytes(raw)
+
+                with self.assertRaises(RecordFormatError):
+                    tier.load(key)
+
+                self.assertIsNone(tier.lookup(key))
+
+    def test_wrong_metadata_field_type_is_record_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = NVMeTier(Path(td) / "nvme", 1024, store)
+            key = _key("wrong-metadata-type")
+            tier.store(key, b"payload", _metadata(key, 7))
+            path = tier.layout.block_path(key)
+            header, payload = _read_raw(path)
+            header["metadata"]["num_layers"] = "one"
+            _write_raw(path, header, payload)
+
+            with self.assertRaises(RecordFormatError):
+                tier.load(key)
+
             self.assertIsNone(tier.lookup(key))
 
     def test_corruption_cleanup_failure_preserves_corruption_classification(self) -> None:
@@ -405,6 +596,11 @@ def _read_raw(path: Path) -> tuple[dict, bytes]:
 def _write_raw(path: Path, header: dict, payload: bytes) -> None:
     encoded = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path.write_bytes(MAGIC + struct.pack(">I", len(encoded)) + encoded + payload)
+
+
+def _encoded_record(header: dict, payload: bytes) -> bytes:
+    encoded = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return MAGIC + HEADER_LEN_STRUCT.pack(len(encoded)) + encoded + payload
 
 
 if __name__ == "__main__":

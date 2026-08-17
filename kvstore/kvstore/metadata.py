@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 import json
+import math
 import re
 from typing import Any
 import time
@@ -99,6 +100,69 @@ class KVMetadata:
     last_access: float = field(default_factory=time.time)
     reuse_count: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self, *, require_checksum: bool = False) -> None:
+        if not isinstance(self.key, BlockKey):
+            raise ValueError("metadata key must be a BlockKey")
+        if (
+            not isinstance(self.dtype, str)
+            or not self.dtype
+            or len(self.dtype.encode("utf-8")) > 64
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.dtype)
+        ):
+            raise ValueError("metadata dtype must be a bounded non-empty string")
+        for name in ("num_layers", "num_kv_heads", "head_dim"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"metadata {name} must be a positive integer")
+        for name in ("tokens", "bytes", "reuse_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"metadata {name} must be a non-negative integer")
+        if not isinstance(self.shape, tuple) or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in self.shape
+        ):
+            raise ValueError("metadata shape must contain non-negative integers")
+        if self.checksum_algo != "sha256":
+            raise ValueError("metadata checksum_algo must be sha256")
+        if (require_checksum or self.checksum) and (
+            not isinstance(self.checksum, str)
+            or not _BLOCK_HASH_RE.fullmatch(self.checksum)
+        ):
+            raise ValueError("metadata checksum must be lowercase SHA-256 hex")
+        for name in ("created_at", "last_access"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"metadata {name} must be a finite timestamp")
+        if not isinstance(self.extra, dict):
+            raise ValueError("metadata extra must be an object")
+        try:
+            json.dumps(self.extra, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata extra must be finite JSON data") from exc
+
+    def payload_descriptor(self) -> tuple[Any, ...]:
+        """Fields that must remain stable for an active BlockKey."""
+
+        return (
+            self.key,
+            self.dtype,
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.tokens,
+            self.bytes,
+            self.shape,
+            self.checksum,
+            self.checksum_algo,
+            self.extra,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

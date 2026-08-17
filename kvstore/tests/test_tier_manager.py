@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from kvstore.cost_model import CostModel, Decision, TierProfile
-from kvstore.errors import BlockNotFound
+from kvstore.errors import BlockNotFound, TierUnavailable
 from kvstore.memory_tier import MemoryTier
 from kvstore.metadata import BlockKey, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
@@ -177,6 +177,90 @@ class TierManagerTest(unittest.TestCase):
             self.assertFalse(memory.contains(key))
             self.assertEqual(sum(metrics.kv_onload_timeout_total.values.values()), 1.0)
             self.assertEqual(sum(metrics.kv_onload_fallback_total.values.values()), 1.0)
+
+    def test_s3_head_timeout_falls_back_to_recompute(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            metrics = KVStoreMetrics()
+            base_client = _FakeS3Client()
+            memory = MemoryTier(1024 * 1024, meta, metrics=metrics)
+            s3 = S3Tier("bucket", "blocks", meta, client=base_client, metrics=metrics)
+            store = MultiTierKVBlockStore(
+                [memory, s3],
+                meta,
+                CostModel(
+                    {
+                        TierName.MEMORY: TierProfile(0.01, 80.0),
+                        TierName.S3: TierProfile(1.0, 10.0),
+                    }
+                ),
+                metrics=metrics,
+            )
+            key = _key("head-timeout")
+            store.store(
+                key,
+                b"payload",
+                _metadata(key, 4096, 7),
+                preferred_tier=TierName.S3,
+            )
+            s3.client = FaultInjectingS3Client(
+                base_client,
+                S3FaultInjectionConfig(
+                    timeout_rate=1.0, operations=("head_object",), seed=9
+                ),
+            )
+
+            with self.assertRaises(TierUnavailable):
+                store.lookup(key)
+
+            with self.assertRaises(BlockNotFound) as raised:
+                store.load(key, target_tier=TierName.MEMORY)
+
+            self.assertIn("tier_lookup_unavailable_recompute", str(raised.exception))
+            self.assertEqual(sum(metrics.kv_onload_timeout_total.values.values()), 2.0)
+            self.assertEqual(sum(metrics.kv_onload_fallback_total.values.values()), 1.0)
+
+    def test_unavailable_s3_lookup_does_not_hide_healthy_nvme_location(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            base_client = _FakeS3Client()
+            memory = MemoryTier(1024 * 1024, meta)
+            nvme = NVMeTier(root / "nvme", 1024 * 1024, meta)
+            s3 = S3Tier("bucket", "blocks", meta, client=base_client)
+            store = MultiTierKVBlockStore(
+                [memory, nvme, s3],
+                meta,
+                CostModel(
+                    {
+                        TierName.MEMORY: TierProfile(0.01, 80.0),
+                        TierName.NVME: TierProfile(0.3, 5.0),
+                        TierName.S3: TierProfile(1.0, 10.0),
+                    },
+                    load_benefit_threshold_ms=0.0,
+                ),
+            )
+            key = _key("healthy-nvme")
+            metadata = _metadata(key, 4096, 7)
+            store.store(key, b"payload", metadata, preferred_tier=TierName.NVME)
+            store.store(
+                key,
+                b"payload",
+                _metadata(key, 4096, 7),
+                preferred_tier=TierName.S3,
+            )
+            s3.client = FaultInjectingS3Client(
+                base_client,
+                S3FaultInjectionConfig(
+                    timeout_rate=1.0, operations=("head_object",), seed=11
+                ),
+            )
+
+            result = store.load(key, target_tier=TierName.MEMORY)
+
+            self.assertEqual(result.data, b"payload")
+            self.assertTrue(memory.contains(key))
 
 
 def _store(root: Path) -> MultiTierKVBlockStore:

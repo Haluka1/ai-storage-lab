@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .errors import MetadataMismatch
 from .metadata import BlockKey, BlockLocation, KVMetadata, TierName
 
 
@@ -164,10 +165,11 @@ class MetadataStore:
             yield
 
     def upsert(self, location: BlockLocation, metadata: KVMetadata) -> None:
+        _validate_upsert(location, metadata)
         with self._mutation_lock, self._lock, self._conn:
             state = self._conn.execute(
                 """
-                SELECT state FROM blocks
+                SELECT state, metadata_json FROM blocks
                 WHERE block_hash=? AND namespace=? AND tier=?
                 """,
                 (
@@ -180,6 +182,18 @@ class MetadataStore:
                 raise RuntimeError(
                     "cannot upsert a block while its delete tombstone is pending"
                 )
+            if state is not None:
+                try:
+                    persisted = KVMetadata.from_dict(json.loads(str(state[1])))
+                    persisted.validate(require_checksum=True)
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise MetadataMismatch(
+                        "persisted metadata is structurally invalid"
+                    ) from exc
+                if persisted.payload_descriptor() != metadata.payload_descriptor():
+                    raise MetadataMismatch(
+                        "active BlockKey metadata descriptor cannot change"
+                    )
             self._conn.execute(
                 """
                 INSERT INTO blocks(
@@ -278,9 +292,13 @@ class MetadataStore:
             ).fetchone()
         if row is None:
             return None
-        metadata = KVMetadata.from_dict(json.loads(row[0]))
-        metadata.last_access = float(row[1])
-        metadata.reuse_count = int(row[2])
+        try:
+            metadata = KVMetadata.from_dict(json.loads(row[0]))
+            metadata.last_access = float(row[1])
+            metadata.reuse_count = int(row[2])
+            metadata.validate(require_checksum=True)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MetadataMismatch("persisted metadata is structurally invalid") from exc
         return metadata
 
     def touch(self, key: BlockKey, tier: TierName) -> None:
@@ -476,16 +494,45 @@ def _location_attributes(location: BlockLocation) -> dict[str, Any]:
     return {field: getattr(location, field) for field in LOCATION_FIELDS}
 
 
+def _validate_upsert(location: BlockLocation, metadata: KVMetadata) -> None:
+    try:
+        metadata.validate(require_checksum=True)
+    except ValueError as exc:
+        raise MetadataMismatch("invalid metadata") from exc
+    if location.key != metadata.key:
+        raise MetadataMismatch("location key does not match metadata key")
+    if not isinstance(location.tier, TierName):
+        raise MetadataMismatch("location tier must be a TierName")
+    if not location.uri:
+        raise MetadataMismatch("location URI must not be empty")
+    if location.bytes < 0 or metadata.bytes < 0 or location.bytes != metadata.bytes:
+        raise MetadataMismatch("location bytes do not match metadata bytes")
+    if location.checksum != metadata.checksum:
+        raise MetadataMismatch("location checksum does not match metadata checksum")
+
+
 def _location_from_row(key: BlockKey, row: tuple[Any, ...]) -> BlockLocation:
-    attributes = json.loads(row[6] or "{}")
-    filtered = {field: attributes[field] for field in LOCATION_FIELDS if field in attributes}
-    return BlockLocation(
-        key=key,
-        tier=TierName(row[0]),
-        uri=str(row[1]),
-        bytes=int(row[2]),
-        checksum=str(row[3]),
-        created_at=float(row[4]),
-        last_access=float(row[5]),
-        **filtered,
-    )
+    try:
+        attributes = json.loads(row[6] or "{}")
+        if not isinstance(attributes, dict):
+            raise ValueError("location attributes must be an object")
+        filtered = {
+            field: attributes[field]
+            for field in LOCATION_FIELDS
+            if field in attributes
+        }
+        location = BlockLocation(
+            key=key,
+            tier=TierName(row[0]),
+            uri=str(row[1]),
+            bytes=int(row[2]),
+            checksum=str(row[3]),
+            created_at=float(row[4]),
+            last_access=float(row[5]),
+            **filtered,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MetadataMismatch("persisted location is structurally invalid") from exc
+    if not location.uri or location.bytes < 0:
+        raise MetadataMismatch("persisted location has invalid core fields")
+    return location

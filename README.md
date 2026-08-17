@@ -36,13 +36,13 @@ The dashed line is deliberately not a call arrow: Router cache metadata and KVSt
 
 ## What is implemented
 
-- **Go Router:** completion/chat subset parsing and proxying, deterministic approximate tokenization, namespace-isolated chained block hashes, CacheIndex TTL/event/sequence handling, routable Worker filtering, round-robin/cache-aware/cost-aware strategies, post-pick locked revalidation, Router-owned inflight lifecycle accounting, drain/remove checks, streaming proxying, and hashed request/tenant identifiers. Opt-in decision logs retain Worker/control-plane metadata for debugging.
-- **Python KVStore protocol:** validated, injectively encoded full namespace keys, memory and file-backed tiers, an optional S3-compatible client boundary, payload-first/metadata-last stores, identity/length/checksum validation, atomic lookup-and-acquire/release, single-process owner locking and epoch cleanup, deleting tombstones, segmented append/compaction, target-aware prefetch/eviction, and load/prefetch/recompute decisions.
-- **Local I/O Profile:** C++17 buffered, `pread`, `mmap`, vectored, and `O_DIRECT` read paths; a small matrix runner; a versioned JSON Schema; a profile generator; and a tested importer into the KV cost model.
+- **Go Router:** completion/chat subset parsing and proxying, deterministic approximate tokenization, namespace-isolated chained block hashes, CacheIndex TTL/event/sequence handling, routable Worker filtering, round-robin/cache-aware/cost-aware strategies, post-pick locked revalidation, Router-owned inflight lifecycle accounting, drain/remove checks, cache-observation cleanup on Worker retirement, streaming proxying, and hashed request/tenant identifiers. Opt-in decision logs retain Worker/control-plane metadata for debugging.
+- **Python KVStore protocol:** validated, injectively encoded full namespace keys, memory and file-backed tiers, an optional S3-compatible client boundary, payload-first/metadata-last publication, immutable active BlockKey payloads, persisted-location boundary checks, record-format/identity/length/checksum validation, atomic lookup-and-acquire/release, single-process owner locking and epoch cleanup, deleting tombstones, segmented append/compaction, target-aware prefetch/eviction, and load/prefetch/recompute decisions.
+- **Local I/O Profile:** C++17 buffered, `pread`, full mapped-byte-scan `mmap`, vectored, and `O_DIRECT` read paths; a small matrix runner; a versioned JSON Schema; a profile generator; and a tested importer into the KV cost model.
 
 ## Quick start
 
-Prerequisites are Go 1.22+, Python 3.10+, CMake 3.16+, a C++17 compiler, and the one Python package listed in `requirements-ci.txt`.
+Prerequisites are a Linux/POSIX environment (WSL is suitable), Go 1.22+, Python 3.10+, CMake 3.16+, a C++17 compiler, and the one Python package listed in `requirements-ci.txt`.
 
 ```bash
 python3 -m pip install -r requirements-ci.txt
@@ -60,7 +60,9 @@ Tests and demos do not contact an external endpoint. `make demo` uses loopback p
 - The Router's block identity chains each block to its parent and includes tenant/model/tokenizer/adapter/modality/cache-salt namespace fields. It is stable for this repository's approximation, not authoritative model-engine identity.
 - CacheIndex filters expired observations, deduplicates non-empty event IDs, and requires positive producer sequences to advance per Worker. Sequence zero is an internal unordered local mode and is rejected by the admin event API.
 - Selection is advisory until the Router reacquires the Worker lock, revalidates routability, and increments Router-owned inflight lifecycle accounting. This count does not reserve Worker compute, memory, or KV capacity, and the proxy does not retry a failed upstream/stream on another Worker.
-- File-backed and S3-compatible stores publish payload before metadata. Loads reacquire metadata and recheck the complete key, byte length, and checksum.
+- A Worker ID cannot change URL or topology in place. Its old registration must be safely drained and removed; removal purges that ID's cache observations before a later explicit registration.
+- File-backed and S3-compatible stores publish payload before metadata. An active BlockKey accepts an idempotent replay only when its bytes and payload descriptor agree; a conflicting payload or descriptor is rejected. Orphan bytes from a failed metadata commit stay invisible until an explicit recovery policy is implemented.
+- Loads reacquire metadata, revalidate persisted file/segment/S3 locations against the configured root or bucket/prefix, and check record structure, complete key, byte length, and checksum.
 - Deletion becomes logically visible through a tombstone before physical cleanup; append-only segment bytes are reclaimed only when a caller explicitly runs synchronous compaction.
 - The cost model makes `load`, asynchronous `prefetch`, or `recompute` explicit instead of treating all located bytes as immediately useful.
 
@@ -105,13 +107,14 @@ The checked-in tier-profile fixture is synthetic contract data, not benchmark ev
 - Cache overlap is a count of individually observed, non-expired chained block IDs. It is not proof of a contiguous reusable prefix or valid payload bytes.
 - The KVStore has not been integrated into the real vLLM/LMCache KV payload hot path.
 - There is no production telemetry, automatic Worker discovery, Router HA, or transparent automatic failover.
+- Worker IDs do not carry a process generation. The control plane must quiesce a retired Worker's event producer before reusing its ID; this is not a generation-safe discovery protocol.
 - Router-owned inflight is single-Router lifecycle accounting, not a capacity reservation. Once an upstream attempt starts—especially after stream bytes are written—the Router does not retry it elsewhere.
 - No RDMA, NIXL, GDS, CXL, or SPDK data plane is implemented.
 - `MemoryTier` means host memory, not HBM. The historical `NVMeTier` class name wraps a file-backed abstraction and is not a validated production NVMe engine.
 - The file-backed tier does not implement `O_DIRECT`; requesting it fails explicitly. `O_DIRECT` exists only in the independent I/O Profile measurement module.
 - File-backed stores default to no strong durable commit guarantee across sudden power loss.
 - The SQLite owner lock is single-process coordination, not a distributed lease.
-- Segment compaction is an explicit synchronous maintenance call, not an online background compactor. A checksum mismatch is surfaced and invalidates the bad location; it is not automatically converted into recomputation.
+- Segment compaction is an explicit synchronous maintenance call, not an online background compactor. File/S3 record-format, identity, length, and checksum corruption is surfaced and invalidates the bad location; it is not automatically converted into recomputation.
 - Tier profiles enter through validated files; they are not live telemetry.
 - Historical LMCache work showed a functional path but no stable or general acceleration.
 - Historical experiment summaries cannot prove the current revision's complete behavior; some lack a recorded source revision.

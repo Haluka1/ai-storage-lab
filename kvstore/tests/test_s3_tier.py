@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from kvstore.errors import BlockNotFound, ChecksumMismatch, CorruptionCleanupFailed, TierUnavailable
+from kvstore.errors import (
+    BlockNotFound,
+    ChecksumMismatch,
+    CorruptionCleanupFailed,
+    ImmutableBlockConflict,
+    MetadataMismatch,
+    RecordFormatError,
+    TierUnavailable,
+)
 from kvstore.layout import storage_key_parts
-from kvstore.metadata import BlockKey, KVMetadata, TierName
+from kvstore.metadata import BlockKey, BlockLocation, KVMetadata, TierName
 from kvstore.metadata_store import MetadataStore
+from kvstore.record import HEADER_LEN_STRUCT, MAGIC
 from kvstore.s3_fault_injection import FaultInjectingS3Client, S3FaultInjectionConfig, S3InjectedTimeout
 from kvstore.s3_tier import S3Tier
 
@@ -31,7 +41,7 @@ class S3TierTest(unittest.TestCase):
             with self.assertRaises(BlockNotFound):
                 tier.load(key)
 
-    def test_lookup_lazy_rehydrates_metadata_from_object(self) -> None:
+    def test_orphan_object_is_not_implicitly_published(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             client = FakeS3Client()
             meta1 = MetadataStore(Path(td) / "meta1.sqlite3")
@@ -41,9 +51,62 @@ class S3TierTest(unittest.TestCase):
 
             meta2 = MetadataStore(Path(td) / "meta2.sqlite3")
             tier2 = S3Tier("bucket", "blocks", meta2, client=client)
-            loc = tier2.lookup(key)
-            self.assertIsNotNone(loc)
-            self.assertEqual(meta2.get_metadata(key, TierName.S3).key, key)
+            self.assertIsNone(tier2.lookup(key))
+            self.assertIsNone(meta2.get_metadata(key, TierName.S3))
+
+    def test_store_rejects_cross_key_metadata_and_conflicting_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key_a = _key("identity-a")
+            key_b = _key("identity-b")
+
+            with self.assertRaises(MetadataMismatch):
+                tier.store(key_a, b"payload", _metadata(key_b, 7))
+
+            tier.store(key_a, b"payload", _metadata(key_a, 7))
+            tier.store(key_a, b"payload", _metadata(key_a, 7))
+            with self.assertRaises(ImmutableBlockConflict):
+                tier.store(key_a, b"changed", _metadata(key_a, 7))
+            changed_metadata = _metadata(key_a, 7)
+            changed_metadata.dtype = "fp16"
+            with self.assertRaises(ImmutableBlockConflict):
+                tier.store(key_a, b"payload", changed_metadata)
+            self.assertEqual(tier.load(key_a).data, b"payload")
+
+    def test_persisted_location_outside_configured_bucket_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("foreign-bucket")
+            payload = b"payload"
+            tier.store(key, payload, _metadata(key, len(payload)))
+            canonical = meta.lookup(key, TierName.S3)[0]
+            foreign_uri = canonical.uri.replace("s3://bucket/", "s3://other-bucket/")
+            meta.upsert(
+                BlockLocation(
+                    key,
+                    TierName.S3,
+                    foreign_uri,
+                    canonical.bytes,
+                    canonical.checksum,
+                    canonical.created_at,
+                    canonical.last_access,
+                ),
+                meta.get_metadata(key, TierName.S3),
+            )
+            client.objects[("other-bucket", "do-not-delete")] = b"sentinel"
+
+            with self.assertRaises(MetadataMismatch):
+                tier.lookup(key)
+            with self.assertRaises(MetadataMismatch):
+                tier.evict(key)
+
+            self.assertEqual(
+                client.objects[("other-bucket", "do-not-delete")], b"sentinel"
+            )
 
     def test_checksum_mismatch_evicts_bad_object(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -57,6 +120,41 @@ class S3TierTest(unittest.TestCase):
             with self.assertRaises(ChecksumMismatch):
                 tier.load(key)
             self.assertIsNone(tier.lookup(key))
+
+    def test_structural_header_corruption_invalidates_location(self) -> None:
+        corrupt_headers = [
+            b"{not-json",
+            json.dumps(
+                {
+                    "version": 999,
+                    "checksum": "0" * 64,
+                    "payload_bytes": 7,
+                    "metadata": {},
+                }
+            ).encode(),
+            json.dumps(
+                {"version": 1, "checksum": "0" * 64, "metadata": {}}
+            ).encode(),
+        ]
+        for index, encoded_header in enumerate(corrupt_headers):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as td:
+                client = FakeS3Client()
+                meta = MetadataStore(Path(td) / "meta.sqlite3")
+                tier = S3Tier("bucket", "blocks", meta, client=client)
+                key = _key(f"bad-header-{index}")
+                tier.store(key, b"payload", _metadata(key, 7))
+                object_key = tier.object_key(key)
+                client.objects[("bucket", object_key)] = (
+                    MAGIC
+                    + HEADER_LEN_STRUCT.pack(len(encoded_header))
+                    + encoded_header
+                    + b"payload"
+                )
+
+                with self.assertRaises(RecordFormatError):
+                    tier.load(key)
+
+                self.assertIsNone(tier.lookup(key))
 
     def test_corruption_cleanup_failure_is_not_reclassified_as_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -128,9 +226,9 @@ class S3TierTest(unittest.TestCase):
             meta.close()
 
             reopened_meta = MetadataStore(db_path)
-            # Retry uses the persisted tombstone URI, not a recomputed key from
-            # possibly changed runtime configuration.
-            reopened = S3Tier("bucket", "changed-prefix", reopened_meta, client=client)
+            # A retry revalidates the persisted URI against the same configured
+            # bucket and prefix before issuing a destructive operation.
+            reopened = S3Tier("bucket", "blocks", reopened_meta, client=client)
             self.assertIsNone(reopened.lookup(key))
             self.assertTrue(reopened.evict(key))
             self.assertNotIn(("bucket", object_key), client.objects)

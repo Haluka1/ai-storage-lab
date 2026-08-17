@@ -4,7 +4,7 @@ This supporting module keeps a small CPU-only path from local POSIX file reads t
 
 ## Included surface
 
-- C++17 engines: buffered I/O, `pread`, `mmap`, vectored I/O, and `O_DIRECT`.
+- C++17 engines: buffered I/O, `pread`, `mmap`, vectored I/O, and `O_DIRECT`. The `mmap` read path scans every byte in the selected mapped block; its latency therefore includes the userspace scan and is not a page-touch-only result.
 - A file generator that requires an explicit `--allowed-root` and rejects symlink/path escapes.
 - A JSON-compatible local matrix runner.
 - A Python profile generator and human-readable report helper.
@@ -25,7 +25,7 @@ cmake -S io-profile -B io-profile/build -DCMAKE_BUILD_TYPE=Release
 cmake --build io-profile/build
 ```
 
-The matrix configuration writes under a temporary directory. Generated numbers describe only the invoking machine/configuration and are not automatically evidence for any README conclusion.
+The matrix configuration writes under a temporary directory. Generated numbers describe only the invoking machine/configuration and are not automatically evidence for any README conclusion. Engine rows have different syscall and CPU mechanics; their reported bandwidth is descriptive for the exact operation and must not be presented as a general cross-engine performance ranking.
 
 ## File contract
 

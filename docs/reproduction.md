@@ -14,7 +14,7 @@ make demo-kv
 make audit
 ```
 
-The Router tests use Go in-process HTTP test doubles. The Router Demo binds only loopback ports and builds into a temporary directory. KV tests use temporary host memory, files, SQLite, and in-process S3 client fakes. I/O tests create small temporary files and accept a structured unavailable result if the local filesystem rejects `O_DIRECT`.
+The Router tests use Go in-process HTTP test doubles. The Router Demo binds only loopback ports and builds into a temporary directory. KV tests use temporary host memory, files, SQLite, and in-process S3 client fakes. I/O tests create small temporary files and accept a structured unavailable result if the local filesystem rejects `O_DIRECT`; the `mmap` operation scans every byte in its selected mapped block rather than reporting page touches as a full-block read.
 
 The Python dependency in `requirements-ci.txt` is required for JSON Schema validation. Installing packages is an environment-preparation step; tests and demos themselves do not make outbound requests.
 

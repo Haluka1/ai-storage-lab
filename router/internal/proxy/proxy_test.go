@@ -429,6 +429,73 @@ func TestConfigAndAdminRejectDuplicateWorkerIDs(t *testing.T) {
 	}
 }
 
+func TestSameWorkerIDCannotMutateIdentityInPlace(t *testing.T) {
+	handler := newTestHandler(t, filepath.Join(t.TempDir(), "decisions.jsonl"), "cost_aware")
+	defer handler.Close()
+	workers := handler.snapshotWorkers()
+	workers[0].URL = "http://replacement-worker.local"
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/workers", strings.NewReader(mustJSON(t, workers)))
+	rec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "identity_change_requires_remove_then_register") {
+		t.Fatalf("identity mutation status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := requireWorker(t, handler.snapshotWorkers(), "worker-a").URL; got != "http://worker-a.local" {
+		t.Fatalf("rejected identity mutation changed URL to %q", got)
+	}
+}
+
+func TestSafeRemovalPurgesWorkerCacheBeforeIDReuse(t *testing.T) {
+	cfg := testConfig(t.TempDir(), "cost_aware")
+	cfg.Workers[0].QueueDepth = 0
+	cfg.Workers[0].ActiveDecodeBlocks = 0
+	cfg.Workers[0].InflightRequests = 0
+	handler, err := NewHandler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Close()
+	handler.index.Store("cached-block", "worker-a", common.TierGPU, 16)
+
+	drainReq := httptest.NewRequest(http.MethodPost, "/admin/workers/worker-a/drain", nil)
+	drainRec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(drainRec, drainReq)
+	if drainRec.Code != http.StatusOK {
+		t.Fatalf("drain status=%d body=%s", drainRec.Code, drainRec.Body.String())
+	}
+	removeReq := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/workers",
+		strings.NewReader(mustJSON(t, []common.WorkerState{cfg.Workers[1]})),
+	)
+	removeRec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("removal status=%d body=%s", removeRec.Code, removeRec.Body.String())
+	}
+	if got := handler.index.OverlapByWorker([]common.BlockHash{"cached-block"}); got["worker-a"] != 0 {
+		t.Fatalf("retired Worker cache survived removal: %v", got)
+	}
+
+	replacement := cfg.Workers[0]
+	replacement.URL = "http://worker-a-generation-2.local"
+	readdReq := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/workers",
+		strings.NewReader(mustJSON(t, []common.WorkerState{cfg.Workers[1], replacement})),
+	)
+	readdRec := httptest.NewRecorder()
+	handler.AdminHandler().ServeHTTP(readdRec, readdReq)
+	if readdRec.Code != http.StatusOK {
+		t.Fatalf("explicit re-registration status=%d body=%s", readdRec.Code, readdRec.Body.String())
+	}
+	if got := handler.index.OverlapByWorker([]common.BlockHash{"cached-block"}); got["worker-a"] != 0 {
+		t.Fatalf("reused Worker ID inherited stale cache: %v", got)
+	}
+}
+
 func TestConfigRejectsInjectedRouterInflightAndNegativeWorkerCounts(t *testing.T) {
 	cfg := testConfig(t.TempDir(), "cost_aware")
 	cfg.Workers[0].RouterInflightRequests = 1

@@ -397,8 +397,10 @@ std::vector<ResultRow> run_worker(const BenchConfig& cfg, int thread_id) {
       if (!mapped) {
         error = "mmap_failed";
       } else {
-        auto* base = static_cast<unsigned char*>(mapped) + offset;
-        for (std::size_t p = 0; p < cfg.block_size; p += 4096) {
+        // Scan every byte so a successful row represents the complete mapped
+        // block, rather than a page-touch sample reported as full-block I/O.
+        auto* base = static_cast<volatile const unsigned char*>(mapped) + offset;
+        for (std::size_t p = 0; p < cfg.block_size; ++p) {
           local_sink += base[p];
         }
         rc = static_cast<ssize_t>(cfg.block_size);

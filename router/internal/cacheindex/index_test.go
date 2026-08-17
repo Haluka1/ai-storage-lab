@@ -38,6 +38,37 @@ func TestEvictIgnoresStaleSeqNo(t *testing.T) {
 	}
 }
 
+func TestEvictWorkerPurgesObservationsAndProducerWatermark(t *testing.T) {
+	idx := New(time.Minute)
+	idx.StoreLocation(common.BlockLocation{
+		BlockHash: "a", WorkerID: "worker-0", Tier: common.TierGPU, SeqNo: 10,
+	})
+	idx.StoreLocation(common.BlockLocation{
+		BlockHash: "b", WorkerID: "worker-0", Tier: common.TierGPU, SeqNo: 11,
+	})
+	idx.StoreLocation(common.BlockLocation{
+		BlockHash: "b", WorkerID: "worker-1", Tier: common.TierGPU, SeqNo: 20,
+	})
+
+	if removed := idx.EvictWorker("worker-0"); removed != 2 {
+		t.Fatalf("removed=%d, want 2", removed)
+	}
+	got := idx.OverlapByWorker([]common.BlockHash{"a", "b"})
+	if got["worker-0"] != 0 || got["worker-1"] != 1 {
+		t.Fatalf("worker purge produced overlap=%v", got)
+	}
+
+	// A deliberately reused ID starts a fresh producer sequence. The caller
+	// must already have quiesced the retired producer because there is no
+	// generation field in this prototype.
+	idx.StoreLocation(common.BlockLocation{
+		BlockHash: "c", WorkerID: "worker-0", Tier: common.TierGPU, SeqNo: 1,
+	})
+	if got := idx.OverlapByWorker([]common.BlockHash{"c"}); got["worker-0"] != 1 {
+		t.Fatalf("fresh sequence was rejected after Worker retirement: %v", got)
+	}
+}
+
 func TestSnapshotRoundTripPreservesOverlap(t *testing.T) {
 	idx := New(time.Minute)
 	idx.Store("a", "worker-0", common.TierGPU, 16)

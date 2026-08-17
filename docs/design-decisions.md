@@ -78,7 +78,7 @@ A strategy selects from a snapshot. A Worker can begin draining or be replaced a
 
 ### Decision
 
-Treat strategy selection as advisory. Reacquire the Worker mutex, find the selected registration, re-run `Routable`, and increment a Router-owned inflight counter while holding the same lock. Keep that lifecycle count until the complete response body, including a stream, has been copied. Removal checks the sum of Worker-reported and Router-owned inflight along with drain/queue/decode state. The counter does not reserve Worker compute, memory, or KV capacity.
+Treat strategy selection as advisory. Reacquire the Worker mutex, find the selected registration, re-run `Routable`, and increment a Router-owned inflight counter while holding the same lock. Keep that lifecycle count until the complete response body, including a stream, has been copied. Removal checks the sum of Worker-reported and Router-owned inflight along with drain/queue/decode state. The counter does not reserve Worker compute, memory, or KV capacity. A stable Worker ID cannot change URL or topology in place: the old identity must be drained and removed, which also purges its CacheIndex observations, before a later explicit registration.
 
 ### Alternatives
 
@@ -88,15 +88,15 @@ Treat strategy selection as advisory. Reacquire the Worker mutex, find the selec
 
 ### Failure semantics
 
-If the Worker disappeared or is no longer routable at reservation time, the Router returns an unavailable error before sending upstream. It does not claim transparent failover. An upstream request or response-copy error still releases the lifecycle count through `defer`; the Router does not retry on another Worker, including after any stream bytes may have been written.
+If the Worker disappeared or is no longer routable at reservation time, the Router returns an unavailable error before sending upstream. It does not claim transparent failover. An upstream request or response-copy error still releases the lifecycle count through `defer`; the Router does not retry on another Worker, including after any stream bytes may have been written. An attempted in-place URL/topology mutation is rejected without changing the registration.
 
 ### Current guarantees
 
-The reservation mutation and routability recheck share one lock. Tests force a drain between selection and reservation and hold a streaming body open while testing removal safety.
+The reservation mutation and routability recheck share one lock. Tests force a drain between selection and reservation, hold a streaming body open while testing removal safety, reject in-place identity mutation, and verify that retirement purges cache observations before ID reuse.
 
 ### Current limitations
 
-This is single-Router process state. It is neither capacity admission nor Router HA, a distributed inflight ledger, or automatic recovery across Router crashes.
+This is single-Router process state. It is neither capacity admission nor Router HA, a distributed inflight ledger, or automatic recovery across Router crashes. Worker IDs have no generation field, so the control plane must quiesce an old event producer before intentionally reusing its ID.
 
 ### Code anchors
 
@@ -112,7 +112,7 @@ Publishing metadata before bytes are completely available lets a concurrent look
 
 ### Decision
 
-Write the payload representation first, then commit the authoritative metadata record. The file-backed content-addressed layout writes a temporary file and atomically replaces the final path before metadata upsert. Segments append a complete header/payload record before metadata upsert. The S3-compatible tier uploads the object before metadata upsert. `BlockKey` uses a versioned canonical JSON namespace for SQLite and shared prefixed base64url components for file/S3-compatible keys; required fields and the lowercase SHA-256 block hash are validated before any path is generated.
+Write the payload representation first, then commit the authoritative metadata record. The file-backed content-addressed layout writes a temporary file and atomically replaces the final path before metadata upsert. Segments append a complete header/payload record before metadata upsert. The S3-compatible tier uploads the object before metadata upsert. A physical payload without active metadata is not implicitly rehydrated. While active, a `BlockKey` is immutable: identical bytes plus the same dtype/shape/token descriptor are an idempotent replay, while conflicting bytes or descriptor fields are rejected before physical replacement. `BlockKey` uses a versioned canonical JSON namespace for SQLite and shared prefixed base64url components for file/S3-compatible keys; required fields and the lowercase SHA-256 block hash are validated before any path is generated.
 
 ### Alternatives
 
@@ -122,15 +122,15 @@ Write the payload representation first, then commit the authoritative metadata r
 
 ### Failure semantics
 
-A failure before metadata commit can leave an orphan payload, but it does not expose an authoritative active record. A load checks identity, length, and checksum; corruption raises a distinct error and invalidates the bad location.
+A failure before metadata commit can leave an orphan payload, but normal lookup does not publish or return it. A load revalidates a persisted location against the tier's configured root or S3 bucket/prefix, then checks the bounded record header, version, required metadata, identity, length, and checksum. Structural or content corruption raises a distinct error and invalidates the bad location. MemoryTier rolls its payload and capacity counters back if metadata commit fails.
 
 ### Current guarantees
 
-Within one live metadata owner, mutation locking serializes competing store/delete operations. Tests cover atomic file publication, adversarial namespace values, root-descendant paths, identity mismatch, short/corrupt payloads, S3 corruption, and S3 timeout as a separate class.
+Within one live metadata owner, mutation locking serializes competing store/delete operations. Metadata upsert enforces equality across the call key, metadata key, location key, length, checksum, and tier. Tests cover immutable active keys, failed metadata commit, orphan invisibility, adversarial namespace values, persisted-location boundaries for URIs, file roots, and buckets, bounded malformed headers, identity/length/checksum mismatch, and S3 unavailability as a separate class.
 
 ### Current limitations
 
-Default file stores do not call a strong durable commit path (`fsync_on_store=False`), so payload-first ordering is not a sudden-power-loss durability guarantee. S3 semantics depend on the supplied compatible client.
+Default file stores do not call a strong durable commit path (`fsync_on_store=False`), so payload-first ordering is not a sudden-power-loss durability guarantee. There is no automatic orphan-recovery or orphan-GC service. S3 semantics depend on the supplied compatible client.
 
 ### Code anchors
 
@@ -142,7 +142,7 @@ Default file stores do not call a strong durable commit path (`fsync_on_store=Fa
 
 ### Problem
 
-Deleting a file/object before changing metadata can race with lookup or lazy rehydration. Deleting metadata first without recording intent can cause a still-present payload to be rediscovered after a crash.
+Deleting a file/object before changing metadata can race with lookup. Deleting metadata first without recording intent loses the durable distinction between an intentionally deleting payload and an orphan left by a failed store.
 
 ### Decision
 
@@ -151,7 +151,7 @@ Deleting a file/object before changing metadata can race with lookup or lazy reh
 ### Alternatives
 
 - Best-effort physical delete followed by metadata delete: leaves race windows and ambiguous crash recovery.
-- Immediately erase metadata: allows content-addressed lazy rehydration of a payload whose deletion was intended.
+- Immediately erase metadata: loses deletion intent while physical bytes may still exist.
 - In-place segment rewriting for every eviction: increases write amplification and concurrency complexity.
 
 ### Failure semantics
@@ -190,11 +190,11 @@ Represent those inputs in a small cost model. A synchronous `load` returns bytes
 
 ### Failure semantics
 
-Missing or corrupt payloads do not silently become hits. A checksum mismatch invalidates the source and propagates as `ChecksumMismatch`; an invalidation failure becomes the explicit `CorruptionCleanupFailed` subtype with the cleanup cause preserved. The tier manager does not translate either corruption class into recomputation. A tested S3-compatible timeout is instead classified as unavailable and returned as a miss-like recompute result. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, and promotes to the requested target.
+Missing or corrupt payloads do not silently become hits. Record-format damage, metadata/identity mismatch, and checksum mismatch invalidate the source and propagate as corruption subclasses; an invalidation failure becomes `CorruptionCleanupFailed` with both the original corruption and cleanup cause preserved. The tier manager does not translate corruption into recomputation. Tested S3 HEAD/GET unavailability is instead isolated from healthy tiers and becomes a miss-like recompute result only when no usable location remains. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, and promotes to the requested target.
 
 ### Current guarantees
 
-Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, promotion, corruption-cleanup classification, timeout fallback, and Schema-validated tier-profile import.
+Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, promotion, structural/content corruption and cleanup classification, S3 lookup/load timeout fallback without hiding a healthy file tier, and Schema-validated tier-profile import.
 
 ### Current limitations
 

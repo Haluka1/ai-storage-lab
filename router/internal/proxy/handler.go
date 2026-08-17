@@ -230,11 +230,12 @@ func (h *Handler) handleReplaceWorkers(w http.ResponseWriter, r *http.Request) {
 		workers[i].LastUpdated = time.Now().UTC()
 	}
 	h.workersMu.Lock()
-	if blocked := unsafeRemovedWorkers(h.workers, workers, h.routerInflight); len(blocked) > 0 {
+	if blocked := workerReplacementConflicts(h.workers, workers, h.routerInflight); len(blocked) > 0 {
 		h.workersMu.Unlock()
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "worker cannot be removed while work remains", "blocked_workers": blocked})
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "worker replacement violates lifecycle contract", "blocked_workers": blocked})
 		return
 	}
+	retiredWorkerIDs := removedWorkerIDs(h.workers, workers)
 	h.workers = append([]common.WorkerState(nil), workers...)
 	for workerID, count := range h.routerInflight {
 		if count == 0 {
@@ -242,6 +243,9 @@ func (h *Handler) handleReplaceWorkers(w http.ResponseWriter, r *http.Request) {
 				delete(h.routerInflight, workerID)
 			}
 		}
+	}
+	for _, workerID := range retiredWorkerIDs {
+		h.index.EvictWorker(workerID)
 	}
 	h.workersMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"updated_workers": len(workers)})
@@ -662,14 +666,20 @@ func workerIDFromAdminAction(path string) (string, bool) {
 	return id, true
 }
 
-func unsafeRemovedWorkers(oldWorkers []common.WorkerState, newWorkers []common.WorkerState, routerInflight map[common.WorkerID]int) []map[string]any {
-	next := make(map[common.WorkerID]bool, len(newWorkers))
+func workerReplacementConflicts(oldWorkers []common.WorkerState, newWorkers []common.WorkerState, routerInflight map[common.WorkerID]int) []map[string]any {
+	next := make(map[common.WorkerID]common.WorkerState, len(newWorkers))
 	for _, worker := range newWorkers {
-		next[worker.ID] = true
+		next[worker.ID] = worker
 	}
 	blocked := make([]map[string]any, 0)
 	for _, worker := range oldWorkers {
-		if next[worker.ID] {
+		if replacement, exists := next[worker.ID]; exists {
+			if worker.URL != replacement.URL || worker.Topology != replacement.Topology {
+				blocked = append(blocked, map[string]any{
+					"id":     string(worker.ID),
+					"reason": "identity_change_requires_remove_then_register",
+				})
+			}
 			continue
 		}
 		worker.RouterInflightRequests = routerInflight[worker.ID]
@@ -680,6 +690,7 @@ func unsafeRemovedWorkers(oldWorkers []common.WorkerState, newWorkers []common.W
 			continue
 		}
 		blocked = append(blocked, map[string]any{
+			"reason":                      "worker_not_safe_to_remove",
 			"id":                          string(worker.ID),
 			"queue_depth":                 worker.QueueDepth,
 			"active_decode_blocks":        worker.ActiveDecodeBlocks,
@@ -689,6 +700,20 @@ func unsafeRemovedWorkers(oldWorkers []common.WorkerState, newWorkers []common.W
 		})
 	}
 	return blocked
+}
+
+func removedWorkerIDs(oldWorkers []common.WorkerState, newWorkers []common.WorkerState) []common.WorkerID {
+	next := make(map[common.WorkerID]struct{}, len(newWorkers))
+	for _, worker := range newWorkers {
+		next[worker.ID] = struct{}{}
+	}
+	removed := make([]common.WorkerID, 0)
+	for _, worker := range oldWorkers {
+		if _, exists := next[worker.ID]; !exists {
+			removed = append(removed, worker.ID)
+		}
+	}
+	return removed
 }
 
 func workerAdminResponse(worker common.WorkerState) map[string]any {

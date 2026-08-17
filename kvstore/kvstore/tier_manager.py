@@ -33,19 +33,43 @@ class MultiTierKVBlockStore:
         self._closed = False
 
     def lookup(self, key: BlockKey) -> BlockLocation | None:
-        for tier_name in self.lookup_order:
-            loc = self.tiers[tier_name].lookup(key)
-            if loc is not None:
-                return loc
+        locations, unavailable = self._scan_locations(key, stop_after_first=True)
+        if locations:
+            return locations[0]
+        if unavailable:
+            raise unavailable[0][1]
         return None
 
     def locations(self, key: BlockKey) -> list[BlockLocation]:
+        locations, unavailable = self._scan_locations(key)
+        if not locations and unavailable:
+            raise unavailable[0][1]
+        return locations
+
+    def _scan_locations(
+        self, key: BlockKey, *, stop_after_first: bool = False
+    ) -> tuple[list[BlockLocation], list[tuple[TierName, TierUnavailable]]]:
         out: list[BlockLocation] = []
+        unavailable: list[tuple[TierName, TierUnavailable]] = []
         for tier_name in self.lookup_order:
-            loc = self.tiers[tier_name].lookup(key)
+            try:
+                loc = self.tiers[tier_name].lookup(key)
+            except TierUnavailable as exc:
+                unavailable.append((tier_name, exc))
+                if is_timeout_exception(exc):
+                    self._metric(
+                        lambda m, tier=tier_name: m.kv_onload_timeout_total.inc(
+                            tier=tier.value,
+                            operation="lookup",
+                            outcome="timeout",
+                        )
+                    )
+                continue
             if loc is not None:
                 out.append(loc)
-        return out
+                if stop_after_first:
+                    break
+        return out, unavailable
 
     def store(self, key: BlockKey, data: bytes, metadata: KVMetadata, preferred_tier: TierName | None = None) -> StoreResult:
         tier_name = preferred_tier or self.lookup_order[0]
@@ -54,10 +78,26 @@ class MultiTierKVBlockStore:
         return self.tiers[tier_name].store(key, data, metadata)
 
     def load(self, key: BlockKey, target_tier: TierName = TierName.MEMORY, slo_budget_ms: float | None = None) -> LoadResult:
-        if target_tier in self.tiers and self.tiers[target_tier].contains(key):
-            return self.tiers[target_tier].load(key)
-        locations = self.locations(key)
+        target_unavailable: list[tuple[TierName, TierUnavailable]] = []
+        if target_tier in self.tiers:
+            try:
+                if self.tiers[target_tier].contains(key):
+                    return self.tiers[target_tier].load(key)
+            except TierUnavailable as exc:
+                target_unavailable.append((target_tier, exc))
+        locations, unavailable = self._scan_locations(key)
+        unavailable = [*target_unavailable, *unavailable]
         if not locations:
+            if unavailable:
+                tier_name, exc = unavailable[0]
+                self._metric(
+                    lambda m: m.kv_onload_fallback_total.inc(
+                        tier=tier_name.value,
+                        decision="recompute",
+                        reason_class="lookup_unavailable",
+                    )
+                )
+                raise BlockNotFound("tier_lookup_unavailable_recompute") from exc
             raise BlockNotFound(key.block_hash)
         ctx = self._request_context(key, locations)
         decision = self.cost_model.decide(locations, ctx, slo_budget_ms=slo_budget_ms)

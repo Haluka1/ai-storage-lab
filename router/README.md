@@ -49,7 +49,7 @@ Admin Worker/event input is a controlled metadata plane, not automatic discovery
 
 ## Lifecycle boundary
 
-Selection and lifecycle accounting are separate steps. [`reserveRoutableWorker`](internal/proxy/handler.go) holds the Worker lock while it rechecks readiness/drain state and increments Router-owned inflight. The count prevents unsafe removal while this Router owns a request; it does not reserve Worker capacity. Removal requires an explicitly draining, idle Worker and zero Worker-reported plus Router-owned inflight. There is no transparent retry—including after a stream starts—or Router HA.
+Selection and lifecycle accounting are separate steps. [`reserveRoutableWorker`](internal/proxy/handler.go) holds the Worker lock while it rechecks readiness/drain state and increments Router-owned inflight. The count prevents unsafe removal while this Router owns a request; it does not reserve Worker capacity. Removal requires an explicitly draining, idle Worker and zero Worker-reported plus Router-owned inflight. A Worker ID cannot change URL/topology in place; safe removal purges that ID's cache observations before an explicit later registration. Worker IDs have no process-generation fence, so an old event producer must be quiesced before ID reuse. There is no transparent retry—including after a stream starts—automatic discovery, or Router HA.
 
 ## Logging and metrics
 
