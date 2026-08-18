@@ -78,6 +78,7 @@ class MultiTierKVBlockStore:
         return self.tiers[tier_name].store(key, data, metadata)
 
     def load(self, key: BlockKey, target_tier: TierName = TierName.MEMORY, slo_budget_ms: float | None = None) -> LoadResult:
+        self._require_target_tier(target_tier)
         target_unavailable: list[tuple[TierName, TierUnavailable]] = []
         if target_tier in self.tiers:
             try:
@@ -127,6 +128,7 @@ class MultiTierKVBlockStore:
         return result
 
     def prefetch(self, keys: list[BlockKey], target_tier: TierName = TierName.MEMORY) -> None:
+        self._require_target_tier(target_tier)
         for key in keys:
             self._metric(lambda m: m.kv_prefetch_total.inc(tier=target_tier.value, outcome="requested"))
             if target_tier in self.tiers and self.tiers[target_tier].contains(key):
@@ -144,6 +146,7 @@ class MultiTierKVBlockStore:
         return removed
 
     def promote(self, key: BlockKey, target_tier: TierName = TierName.MEMORY) -> bool:
+        self._require_target_tier(target_tier)
         try:
             self.load(key, target_tier=target_tier)
             return target_tier in self.tiers and self.tiers[target_tier].contains(key)
@@ -202,6 +205,11 @@ class MultiTierKVBlockStore:
     def _store_promotion(self, target_tier: TierName, result: LoadResult) -> None:
         promoted_meta = replace(result.metadata)
         self.tiers[target_tier].store(result.key, result.data, promoted_meta)
+
+    def _require_target_tier(self, target_tier: TierName) -> None:
+        if target_tier not in self.tiers:
+            value = getattr(target_tier, "value", str(target_tier))
+            raise TierUnavailable(f"target tier is not configured: {value}")
 
     def _metric(self, fn) -> None:
         if self.metrics is None:

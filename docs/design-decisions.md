@@ -190,11 +190,11 @@ Represent those inputs in a small cost model. A synchronous `load` returns bytes
 
 ### Failure semantics
 
-Missing or corrupt payloads do not silently become hits. Record-format damage, metadata/identity mismatch, and checksum mismatch invalidate the source and propagate as corruption subclasses; an invalidation failure becomes `CorruptionCleanupFailed` with both the original corruption and cleanup cause preserved. The tier manager does not translate corruption into recomputation. Tested S3 HEAD, GET-call, body-read, and body-close unavailability is instead isolated from healthy tiers and becomes a miss-like recompute result only when no usable location remains. Every acquired streaming response body is closed. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, and promotes to the requested target.
+Missing or corrupt payloads do not silently become hits. Record-format damage, metadata/identity mismatch, and checksum mismatch invalidate the source and propagate as corruption subclasses; an invalidation failure becomes `CorruptionCleanupFailed` with both the original corruption and cleanup cause preserved. The tier manager does not translate corruption into recomputation. Tested S3 HEAD, GET-call, bounded body-read, and body-close unavailability is instead isolated from healthy tiers and becomes a miss-like recompute result only when no usable location remains. S3 records are read as a bounded prefix/header/payload/trailing-byte sequence, and only an explicit `NoSuchKey` is object absence; bucket, authorization, and ambiguous `404` failures remain unavailable. Every acquired streaming response body is closed. A selected asynchronous prefetch does not block the request, is deduplicated by key and target tier, promotes to the requested target, and rejects an unconfigured target before submission.
 
 ### Current guarantees
 
-Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, promotion, structural/content corruption and cleanup classification, S3 lookup/call/body timeout fallback and response-body cleanup without hiding a healthy file tier, and Schema-validated tier-profile import.
+Unit tests cover short-prefix recompute, longer-prefix load, reuse-sensitive S3 decisions, target-aware asynchronous prefetch, missing-target rejection, promotion, structural/content corruption and cleanup classification, bounded S3 record reads, explicit object-not-found versus service-unavailable classification, S3 lookup/call/body timeout fallback and response-body cleanup without hiding a healthy file tier, and Schema-validated tier-profile import.
 
 ### Current limitations
 

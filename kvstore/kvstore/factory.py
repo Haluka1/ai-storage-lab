@@ -10,7 +10,7 @@ from .metadata import TierName
 from .metadata_store import MetadataStore
 from .metrics import KVStoreMetrics
 from .nvme_tier import NVMeTier
-from .s3_tier import S3Tier
+from .s3_tier import DEFAULT_S3_MAX_PAYLOAD_BYTES, S3Tier
 from .tier_profile_import import profiles_from_tier_profile
 from .tier_manager import MultiTierKVBlockStore
 
@@ -21,6 +21,16 @@ def build_store_from_config(config_path: str | Path) -> MultiTierKVBlockStore:
     base_dir = _config_base_dir(config_file)
     metadata_db = _resolve_path(base_dir, cfg.get("kvstore", {}).get("metadata_db", "./data/kvstore/metadata.sqlite3"))
     metadata_store = MetadataStore(metadata_db)
+    try:
+        return _build_store(cfg, base_dir, metadata_store)
+    except BaseException:
+        metadata_store.close()
+        raise
+
+
+def _build_store(
+    cfg: dict[str, Any], base_dir: Path, metadata_store: MetadataStore
+) -> MultiTierKVBlockStore:
     metrics = KVStoreMetrics()
     tiers = []
     tier_cfg = cfg.get("tiers", {})
@@ -54,6 +64,9 @@ def build_store_from_config(config_path: str | Path) -> MultiTierKVBlockStore:
                 connect_timeout_ms=int(s3_cfg.get("connect_timeout_ms", 500)),
                 read_timeout_ms=int(s3_cfg.get("read_timeout_ms", 2000)),
                 max_retries=int(s3_cfg.get("max_retries", 2)),
+                max_payload_bytes=int(
+                    s3_cfg.get("max_payload_bytes", DEFAULT_S3_MAX_PAYLOAD_BYTES)
+                ),
                 fault_injection=s3_cfg.get("fault_injection"),
                 metadata_store=metadata_store,
                 metrics=metrics,

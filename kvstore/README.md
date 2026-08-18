@@ -28,8 +28,9 @@ Tests use temporary directories and in-process client fakes. The default [`confi
 - `deleting` tombstones make deletion logically visible before physical cleanup and survive incomplete cleanup.
 - Segment records are append-only; a caller-invoked synchronous compaction pass reclaims logical deletions and skips acquired blocks. There is no online background compactor.
 - Cost decisions explicitly distinguish synchronous load, asynchronous prefetch, and recompute.
-- S3-compatible HEAD/GET/body-read timeout or unavailability and record/content corruption are separate failure classes. Obtained streaming bodies are closed, including failure paths. An unavailable S3 observation does not hide a healthy local location; with no healthy location the tier manager returns a miss-like recompute result. Corruption is surfaced and is not automatically converted to recompute.
-- Asynchronous prefetch deduplicates by `(BlockKey, target tier)` and promotes to the caller-requested tier.
+- S3-compatible HEAD/GET/body-read timeout or unavailability and record/content corruption are separate failure classes. Only an explicit object-level `NoSuchKey` is absence; bucket, authorization, endpoint, and ambiguous `404` failures remain unavailable. Obtained streaming bodies are closed, including failure paths. An unavailable S3 observation does not hide a healthy local location; with no healthy location the tier manager returns a miss-like recompute result. Corruption is surfaced and is not automatically converted to recompute.
+- S3 response records are read in bounded stages: fixed prefix, at most 64 KiB of header, the configured payload, and a one-byte trailing-data check. The default per-block limit is 256 MiB and can be lowered with `max_payload_bytes`. Store still assembles an in-memory request body, so this is a bounded protocol prototype rather than a large-object streaming engine.
+- Asynchronous prefetch deduplicates by `(BlockKey, target tier)` and promotes to the caller-requested tier. Load, prefetch, and promote reject an unconfigured target before work is submitted.
 
 ## Durability and coordination boundary
 

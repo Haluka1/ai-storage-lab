@@ -111,6 +111,46 @@ class TierManagerTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_cost_model_prefetch_rejects_unconfigured_target_before_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            nvme = NVMeTier(root / "nvme", 1024, meta)
+            store = MultiTierKVBlockStore(
+                [nvme], meta, _PrefetchOnlyCostModel(TierName.NVME)
+            )
+            key = _key("missing-prefetch-target")
+            store.store(
+                key,
+                b"payload",
+                _metadata(key, 4096, 7),
+                preferred_tier=TierName.NVME,
+            )
+            try:
+                with self.assertRaisesRegex(TierUnavailable, "not configured"):
+                    store.load(key, target_tier=TierName.MEMORY)
+                self.assertEqual(store.stats()["prefetch"]["submitted"], 0)
+                self.assertEqual(store.stats()["prefetch"]["pending"], 0)
+            finally:
+                store.close()
+
+    def test_prefetch_and_promote_reject_unconfigured_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            meta = MetadataStore(root / "meta.sqlite3")
+            nvme = NVMeTier(root / "nvme", 1024, meta)
+            store = MultiTierKVBlockStore(
+                [nvme], meta, _PrefetchOnlyCostModel(TierName.NVME)
+            )
+            key = _key("missing-explicit-target")
+            try:
+                with self.assertRaisesRegex(TierUnavailable, "not configured"):
+                    store.prefetch([key], target_tier=TierName.MEMORY)
+                with self.assertRaisesRegex(TierUnavailable, "not configured"):
+                    store.promote(key, target_tier=TierName.MEMORY)
+            finally:
+                store.close()
+
     def test_nvme_load_promotes_to_memory(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = _store(Path(td))
@@ -468,7 +508,7 @@ class _ReadFailureBody:
     def __init__(self) -> None:
         self.closed = False
 
-    def read(self) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         raise TimeoutError("injected streaming body timeout")
 
     def close(self) -> None:

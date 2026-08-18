@@ -121,12 +121,19 @@ class _ThrottledBody:
         self.body = body
         self.throttle_mbps = throttle_mbps
         self.stats = stats
+        self._bytes_offset = 0
 
-    def read(self, *args, **kwargs) -> bytes:
-        if isinstance(self.body, bytes):
-            data = self.body
+    def read(self, amt: int | None = None) -> bytes:
+        if isinstance(self.body, (bytes, bytearray, memoryview)):
+            raw = self.body
+            if amt is None or amt < 0:
+                end = len(raw)
+            else:
+                end = min(self._bytes_offset + amt, len(raw))
+            data = bytes(raw[self._bytes_offset:end])
+            self._bytes_offset = end
         else:
-            data = self.body.read(*args, **kwargs)
+            data = self.body.read() if amt is None else self.body.read(amt)
         _throttle_len(len(data), self.throttle_mbps, self.stats)
         return data
 

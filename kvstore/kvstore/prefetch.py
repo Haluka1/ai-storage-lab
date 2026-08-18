@@ -39,7 +39,13 @@ class Prefetcher:
                 return PrefetchSubmitResult(False, "queue_full")
             self._seen.add(work)
             self._submitted += 1
-        future = self._executor.submit(self._run_one, work)
+        try:
+            future = self._executor.submit(self._run_one, work)
+        except BaseException:
+            with self._lock:
+                self._seen.discard(work)
+                self._submitted -= 1
+            raise
         future.add_done_callback(lambda fut, item=work: self._done(item, fut))
         return PrefetchSubmitResult(True, "submitted")
 

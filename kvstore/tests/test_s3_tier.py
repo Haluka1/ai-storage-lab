@@ -14,6 +14,7 @@ from kvstore.errors import (
     ImmutableBlockConflict,
     MetadataMismatch,
     RecordFormatError,
+    StoreFull,
     TierUnavailable,
 )
 from kvstore.layout import storage_key_parts
@@ -255,6 +256,171 @@ class S3TierTest(unittest.TestCase):
             self.assertEqual(tier.load(key).data, b"payload")
             self.assertEqual(body.close_calls, 1)
 
+    def test_s3_oversized_body_is_rejected_before_payload_read(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier(
+                "bucket", "blocks", meta, client=client, max_payload_bytes=8
+            )
+            key = _key("oversized-body")
+            tier.store(key, b"payload", _metadata(key, 7))
+            metadata = _metadata(key, 9)
+            metadata.checksum = "0" * 64
+            header = json.dumps(
+                {
+                    "version": 1,
+                    "checksum": metadata.checksum,
+                    "payload_bytes": 9,
+                    "metadata": metadata.to_dict(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            body = BoundedReadBody(
+                MAGIC + HEADER_LEN_STRUCT.pack(len(header)) + header + b"ignored"
+            )
+            client.body_override = body
+
+            with self.assertRaises(RecordFormatError):
+                tier.load(key)
+
+            self.assertTrue(body.closed)
+            self.assertTrue(body.read_sizes)
+            self.assertNotIn(-1, body.read_sizes)
+            self.assertLessEqual(body.bytes_returned, len(MAGIC) + 4 + len(header))
+
+    def test_s3_store_rejects_payload_above_configured_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier(
+                "bucket", "blocks", meta, client=client, max_payload_bytes=4
+            )
+            key = _key("store-limit")
+
+            with self.assertRaisesRegex(StoreFull, "protocol limit"):
+                tier.store(key, b"12345", _metadata(key, 5))
+
+            self.assertEqual(client.objects, {})
+
+    def test_no_such_bucket_does_not_delete_active_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("missing-bucket-lookup")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.head_error = FakeS3ServiceError("NoSuchBucket")
+
+            with self.assertRaises(TierUnavailable):
+                tier.lookup(key)
+
+            self.assertEqual(len(meta.lookup(key, TierName.S3)), 1)
+
+    def test_no_such_bucket_does_not_finish_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("missing-bucket-delete")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.delete_error = FakeS3ServiceError("NoSuchBucket")
+            client.head_error = FakeS3ServiceError("NoSuchBucket")
+
+            with self.assertRaises(TierUnavailable):
+                tier.evict(key)
+
+            self.assertTrue(meta.is_deleting(key, TierName.S3))
+
+    def test_ambiguous_head_404_preserves_active_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("ambiguous-404")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.head_error = FakeS3ServiceError("404")
+
+            with self.assertRaises(TierUnavailable):
+                tier.lookup(key)
+
+            self.assertEqual(len(meta.lookup(key, TierName.S3)), 1)
+
+    def test_access_denied_is_unavailable_and_preserves_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("access-denied")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.head_error = FakeS3ServiceError("AccessDenied")
+
+            with self.assertRaises(TierUnavailable):
+                tier.lookup(key)
+
+            self.assertEqual(len(meta.lookup(key, TierName.S3)), 1)
+
+    def test_get_no_such_bucket_is_unavailable_and_preserves_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("get-missing-bucket")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.get_error = FakeS3ServiceError("NoSuchBucket")
+
+            with self.assertRaises(TierUnavailable):
+                tier.load(key)
+
+            self.assertEqual(len(meta.lookup(key, TierName.S3)), 1)
+
+    def test_s3_trailing_bytes_are_rejected_and_invalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("trailing-data")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            client.body_override = BoundedReadBody(
+                client.objects[("bucket", object_key)] + b"unexpected"
+            )
+
+            with self.assertRaisesRegex(ChecksumMismatch, "trailing"):
+                tier.load(key)
+
+            self.assertIsNone(meta.get_metadata(key, TierName.S3))
+
+    def test_partial_bounded_reads_reassemble_record(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("partial-bounded-reads")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            body = BoundedReadBody(
+                client.objects[("bucket", object_key)], max_chunk=3
+            )
+            client.body_override = body
+
+            self.assertEqual(tier.load(key).data, b"payload")
+            self.assertTrue(body.closed)
+            self.assertNotIn(-1, body.read_sizes)
+
+    def test_delete_confirmation_accepts_contextual_ambiguous_404(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            client = FakeS3Client()
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("delete-confirmation-404")
+            tier.store(key, b"payload", _metadata(key, 7))
+            client.head_error = FakeS3ServiceError("404")
+
+            self.assertTrue(tier.evict(key))
+            self.assertFalse(meta.is_deleting(key, TierName.S3))
+
     def test_body_read_error_remains_primary_when_close_also_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             client = FakeS3Client()
@@ -319,6 +485,24 @@ class S3TierTest(unittest.TestCase):
         response = client.get_object(Bucket="bucket", Key="key")
         self.assertEqual(response["Body"].read(), b"payload")
         self.assertEqual(client.stats()["throttled_bytes_total"], 7.0)
+
+    def test_fault_injection_raw_bytes_body_honors_bounded_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = FakeS3Client()
+            client = FaultInjectingS3Client(
+                base,
+                S3FaultInjectionConfig(
+                    throttle_mbps=1_000_000.0, operations=("get_object",)
+                ),
+            )
+            meta = MetadataStore(Path(td) / "meta.sqlite3")
+            tier = S3Tier("bucket", "blocks", meta, client=client)
+            key = _key("raw-throttled-body")
+            tier.store(key, b"payload", _metadata(key, 7))
+            object_key = tier.object_key(key)
+            base.body_override = base.objects[("bucket", object_key)]
+
+            self.assertEqual(tier.load(key).data, b"payload")
 
     def test_delete_failure_keeps_tombstone_and_retry_survives_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -395,6 +579,9 @@ class FakeS3Client:
         self.delete_noop = False
         self.head_calls = 0
         self.body_override = None
+        self.get_error = None
+        self.head_error = None
+        self.delete_error = None
 
     def put_object(self, Bucket: str, Key: str, Body: bytes, Metadata: dict[str, str]):
         self.objects[(Bucket, Key)] = bytes(Body)
@@ -403,6 +590,8 @@ class FakeS3Client:
         return {}
 
     def get_object(self, Bucket: str, Key: str):
+        if self.get_error is not None:
+            raise self.get_error
         key = (Bucket, Key)
         if key not in self.objects:
             raise FakeNotFound()
@@ -413,12 +602,16 @@ class FakeS3Client:
 
     def head_object(self, Bucket: str, Key: str):
         self.head_calls += 1
+        if self.head_error is not None:
+            raise self.head_error
         key = (Bucket, Key)
         if key not in self.objects:
             raise FakeNotFound()
         return {"Metadata": self.metadata.get(key, {}), "ContentLength": len(self.objects[key])}
 
     def delete_object(self, Bucket: str, Key: str):
+        if self.delete_error is not None:
+            raise self.delete_error
         if self.delete_failures_remaining > 0:
             self.delete_failures_remaining -= 1
             raise TimeoutError("injected delete timeout")
@@ -436,11 +629,17 @@ class FakeNotFound(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
 
 
+class FakeS3ServiceError(Exception):
+    def __init__(self, code: str):
+        super().__init__(f"simulated S3 service error: {code}")
+        self.response = {"Error": {"Code": code}}
+
+
 class ReadFailureBody:
     def __init__(self) -> None:
         self.closed = False
 
-    def read(self) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         raise TimeoutError("injected streaming body timeout")
 
     def close(self) -> None:
@@ -450,10 +649,16 @@ class ReadFailureBody:
 class CloseFailureBody:
     def __init__(self, data: bytes) -> None:
         self._data = data
+        self._offset = 0
         self.close_calls = 0
 
-    def read(self) -> bytes:
-        return self._data
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._data) - self._offset
+        end = min(self._offset + size, len(self._data))
+        chunk = self._data[self._offset:end]
+        self._offset = end
+        return chunk
 
     def close(self) -> None:
         self.close_calls += 1
@@ -463,10 +668,16 @@ class CloseFailureBody:
 class TrackingBody:
     def __init__(self, data: bytes) -> None:
         self._data = data
+        self._offset = 0
         self.close_calls = 0
 
-    def read(self) -> bytes:
-        return self._data
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._data) - self._offset
+        end = min(self._offset + size, len(self._data))
+        chunk = self._data[self._offset:end]
+        self._offset = end
+        return chunk
 
     def close(self) -> None:
         self.close_calls += 1
@@ -476,12 +687,37 @@ class ReadAndCloseFailureBody:
     def __init__(self) -> None:
         self.close_calls = 0
 
-    def read(self) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         raise TimeoutError("injected streaming body timeout")
 
     def close(self) -> None:
         self.close_calls += 1
         raise OSError("injected streaming body close failure")
+
+
+class BoundedReadBody:
+    def __init__(self, data: bytes, max_chunk: int | None = None) -> None:
+        self._data = data
+        self._offset = 0
+        self._max_chunk = max_chunk
+        self.read_sizes: list[int] = []
+        self.bytes_returned = 0
+        self.closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        if size < 0:
+            raise AssertionError("unbounded S3 body read")
+        if self._max_chunk is not None:
+            size = min(size, self._max_chunk)
+        end = min(self._offset + size, len(self._data))
+        chunk = self._data[self._offset:end]
+        self._offset = end
+        self.bytes_returned += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _key(seed: str) -> BlockKey:

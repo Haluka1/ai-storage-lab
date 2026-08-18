@@ -33,6 +33,7 @@ from .record import (
 from .s3_fault_injection import FaultInjectingS3Client, S3FaultInjectionConfig
 
 MAX_S3_PAYLOAD_BYTES = 16 * 1024 * 1024 * 1024
+DEFAULT_S3_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 MAX_S3_PREFIX_BYTES = 1024
 _BUCKET_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,253}[A-Za-z0-9])?$")
 
@@ -51,6 +52,7 @@ class S3Tier:
         connect_timeout_ms: int = 500,
         read_timeout_ms: int = 2000,
         max_retries: int = 2,
+        max_payload_bytes: int = DEFAULT_S3_MAX_PAYLOAD_BYTES,
         client: Any | None = None,
         fault_injection: dict[str, Any] | S3FaultInjectionConfig | None = None,
         metrics: KVStoreMetrics | None = None,
@@ -74,6 +76,16 @@ class S3Tier:
         self.connect_timeout_ms = connect_timeout_ms
         self.read_timeout_ms = read_timeout_ms
         self.max_retries = max_retries
+        if (
+            isinstance(max_payload_bytes, bool)
+            or not isinstance(max_payload_bytes, int)
+            or max_payload_bytes <= 0
+            or max_payload_bytes > MAX_S3_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                "max_payload_bytes must be between 1 byte and the S3 protocol limit"
+            )
+        self.max_payload_bytes = max_payload_bytes
         self.metrics = metrics
         base_client = client or self._build_client(endpoint_url, access_key_env, secret_key_env, connect_timeout_ms, read_timeout_ms, max_retries)
         self.client = _maybe_fault_inject(base_client, fault_injection)
@@ -108,7 +120,7 @@ class S3Tier:
         if metadata.key != key:
             raise MetadataMismatch("store key does not match metadata key")
         data = bytes(data)
-        if len(data) > MAX_S3_PAYLOAD_BYTES:
+        if len(data) > self.max_payload_bytes:
             raise StoreFull("block exceeds S3 record protocol limit")
         checksum = sha256_hex(data)
         with self.metadata_store.mutation():
@@ -238,7 +250,9 @@ class S3Tier:
                     # Keep the durable tombstone: the object remains physically
                     # present but must not become visible through lazy rehydrate.
                     raise TierUnavailable(f"s3 delete_object failed: {exc}") from exc
-            if self._head_exists(object_key, bucket=bucket):
+            if self._head_exists(
+                object_key, bucket=bucket, allow_ambiguous_not_found=True
+            ):
                 raise TierUnavailable(
                     "s3 delete_object returned successfully but the object remains visible"
                 )
@@ -259,6 +273,7 @@ class S3Tier:
             "connect_timeout_ms": self.connect_timeout_ms,
             "read_timeout_ms": self.read_timeout_ms,
             "max_retries": self.max_retries,
+            "max_payload_bytes": self.max_payload_bytes,
         }
         if isinstance(self.client, FaultInjectingS3Client):
             data["fault_injection"] = self.client.stats()
@@ -289,12 +304,20 @@ class S3Tier:
             raise MetadataMismatch("persisted S3 location is outside configured bucket/prefix")
         return self.bucket, object_key
 
-    def _head_exists(self, object_key: str, bucket: str | None = None) -> bool:
+    def _head_exists(
+        self,
+        object_key: str,
+        bucket: str | None = None,
+        *,
+        allow_ambiguous_not_found: bool = False,
+    ) -> bool:
         try:
             self.client.head_object(Bucket=bucket or self.bucket, Key=object_key)
             return True
         except Exception as exc:
-            if _is_not_found(exc):
+            if _is_not_found(
+                exc, allow_ambiguous_404=allow_ambiguous_not_found
+            ):
                 return False
             raise TierUnavailable(f"s3 head_object failed: {exc}") from exc
 
@@ -309,29 +332,7 @@ class S3Tier:
             body = obj["Body"]
         except (KeyError, TypeError) as exc:
             raise TierUnavailable("s3 get_object response has no readable body") from exc
-        raw = _read_body(body)
-        if len(raw) < len(MAGIC) + HEADER_LEN_STRUCT.size:
-            raise ChecksumMismatch(object_key)
-        if raw[: len(MAGIC)] != MAGIC:
-            raise ChecksumMismatch(object_key)
-        offset = len(MAGIC)
-        header_len = HEADER_LEN_STRUCT.unpack(raw[offset : offset + HEADER_LEN_STRUCT.size])[0]
-        offset += HEADER_LEN_STRUCT.size
-        if header_len <= 0 or header_len > MAX_HEADER_BYTES:
-            raise RecordFormatError(f"{object_key}: invalid record header length")
-        header_end = offset + header_len
-        if header_end > len(raw):
-            raise RecordFormatError(f"{object_key}: truncated record header")
-        header = decode_record_header(
-            raw[offset:header_end],
-            object_key,
-            max_payload_bytes=MAX_S3_PAYLOAD_BYTES,
-            require_layout_mode=False,
-        )
-        payload = raw[header_end:]
-        if len(payload) != int(header["payload_bytes"]):
-            raise ChecksumMismatch(f"{object_key}: payload length mismatch")
-        return header, payload
+        return _read_body(body, object_key, self.max_payload_bytes)
 
     def _location_for(self, key: BlockKey, object_key: str, bytes_: int, checksum: str, created_at: float, last_access: float) -> BlockLocation:
         return BlockLocation(
@@ -382,9 +383,11 @@ class S3Tier:
         )
 
 
-def _read_body(body: Any) -> bytes:
-    if isinstance(body, bytes):
-        return body
+def _read_body(
+    body: Any, source: str, max_payload_bytes: int
+) -> tuple[dict[str, Any], bytes]:
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        body = _BytesBody(bytes(body))
     read = getattr(body, "read", None)
     close = getattr(body, "close", None)
     if not callable(read):
@@ -395,13 +398,49 @@ def _read_body(body: Any) -> bytes:
                 raise TierUnavailable("s3 body is unreadable and close failed") from exc
         raise TierUnavailable("s3 body does not support read")
 
-    data: Any = None
+    result: tuple[dict[str, Any], bytes] | None = None
     read_error: Exception | None = None
+    read_traceback = None
     close_error: Exception | None = None
     try:
-        data = read()
+        prefix = _read_exact(
+            read,
+            len(MAGIC) + HEADER_LEN_STRUCT.size,
+            source,
+            ChecksumMismatch,
+            "truncated record prefix",
+        )
+        if prefix[: len(MAGIC)] != MAGIC:
+            raise ChecksumMismatch(source)
+        header_len = HEADER_LEN_STRUCT.unpack(prefix[len(MAGIC) :])[0]
+        if header_len <= 0 or header_len > MAX_HEADER_BYTES:
+            raise RecordFormatError(f"{source}: invalid record header length")
+        encoded_header = _read_exact(
+            read,
+            header_len,
+            source,
+            RecordFormatError,
+            "truncated record header",
+        )
+        header = decode_record_header(
+            encoded_header,
+            source,
+            max_payload_bytes=max_payload_bytes,
+            require_layout_mode=False,
+        )
+        payload = _read_exact(
+            read,
+            int(header["payload_bytes"]),
+            source,
+            ChecksumMismatch,
+            "payload length mismatch",
+        )
+        if _read_chunk(read, 1):
+            raise ChecksumMismatch(f"{source}: trailing record data")
+        result = (header, payload)
     except Exception as exc:
         read_error = exc
+        read_traceback = exc.__traceback__
     finally:
         if callable(close):
             try:
@@ -410,29 +449,76 @@ def _read_body(body: Any) -> bytes:
                 close_error = exc
 
     if read_error is not None:
-        unavailable = TierUnavailable("s3 response body read failed")
         if close_error is not None:
-            # ``BaseException.add_note`` is only available on Python 3.11+.
-            # Preserve the secondary cleanup failure without raising the
-            # repository's documented Python floor above 3.10.
-            unavailable.close_error = close_error
-        raise unavailable from read_error
+            read_error.close_error = close_error
+        raise read_error.with_traceback(read_traceback)
     if close_error is not None:
         raise TierUnavailable("s3 response body close failed") from close_error
+    if result is None:
+        raise TierUnavailable("s3 response body produced no result")
+    return result
+
+
+def _read_exact(
+    read,
+    size: int,
+    source: str,
+    error_type,
+    detail: str,
+) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = _read_chunk(read, remaining)
+        if not chunk:
+            raise error_type(f"{source}: {detail}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_chunk(read, size: int) -> bytes:
+    try:
+        data = read(size)
+    except Exception as exc:
+        raise TierUnavailable("s3 response body read failed") from exc
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TierUnavailable("s3 response body read returned non-bytes data")
-    return bytes(data)
+    chunk = bytes(data)
+    if len(chunk) > size:
+        raise TierUnavailable("s3 response body ignored bounded read size")
+    return chunk
 
 
-def _is_not_found(exc: Exception) -> bool:
+class _BytesBody:
+    def __init__(self, data: bytes):
+        self._data = data
+        self._offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._data) - self._offset
+        end = min(self._offset + size, len(self._data))
+        chunk = self._data[self._offset:end]
+        self._offset = end
+        return chunk
+
+    def close(self) -> None:
+        return None
+
+
+def _is_not_found(
+    exc: Exception, *, allow_ambiguous_404: bool = False
+) -> bool:
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
         code = str(response.get("Error", {}).get("Code", ""))
-        if code in {"404", "NoSuchKey", "NotFound", "NoSuchBucket"}:
+        if code == "NoSuchKey":
+            return True
+        if allow_ambiguous_404 and code in {"404", "NotFound"}:
             return True
     name = exc.__class__.__name__.lower()
-    msg = str(exc).lower()
-    return "nosuchkey" in name or "notfound" in name or "not found" in msg or "404" in msg
+    return name in {"nosuchkey", "nosuchkeyerror"}
 
 
 def _maybe_fault_inject(client: Any, config: dict[str, Any] | S3FaultInjectionConfig | None) -> Any:

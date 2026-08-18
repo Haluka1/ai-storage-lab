@@ -86,6 +86,16 @@ class AdmissionEvictionPrefetchTest(unittest.TestCase):
             gate.set()
             prefetcher.shutdown()
 
+    def test_submit_after_shutdown_rolls_back_pending_and_submitted(self) -> None:
+        prefetcher = Prefetcher(_FakePrefetchStore(threading.Event()))
+        prefetcher.shutdown()
+
+        with self.assertRaises(RuntimeError):
+            prefetcher.submit(_key("after-shutdown"), TierName.MEMORY)
+
+        self.assertEqual(prefetcher.stats()["pending"], 0)
+        self.assertEqual(prefetcher.stats()["submitted"], 0)
+
 
 class _FakePrefetchStore:
     def __init__(self, gate: threading.Event):

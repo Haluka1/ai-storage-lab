@@ -4,12 +4,40 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from kvstore.factory import build_store_from_config
 from kvstore.metadata import BlockKey, KVMetadata, TierName
 
 
 class FactoryTest(unittest.TestCase):
+    def test_construction_failure_closes_metadata_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg_path = root / "kvcache.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "kvstore": {"metadata_db": str(root / "meta.sqlite3")},
+                        "tiers": {
+                            "memory": {"enabled": False},
+                            "nvme": {"enabled": True},
+                            "s3": {"enabled": False},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("kvstore.factory.MetadataStore") as metadata_cls:
+                with mock.patch(
+                    "kvstore.factory.NVMeTier",
+                    side_effect=RuntimeError("injected construction failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "construction failure"):
+                        build_store_from_config(cfg_path)
+
+                metadata_cls.return_value.close.assert_called_once_with()
+
     def test_nvme_segment_layout_from_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -43,6 +71,7 @@ class FactoryTest(unittest.TestCase):
             loc = store.lookup(key)
             self.assertIsNotNone(loc)
             self.assertTrue(loc.uri.startswith("segment://"))
+            store.close()
 
 
 if __name__ == "__main__":
